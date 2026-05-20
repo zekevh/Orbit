@@ -94,10 +94,22 @@ final class OrbitDatabase: @unchecked Sendable {
                 """
             case .recentActivity:
                 filterClause = """
-                AND EXISTS (
-                    SELECT 1 FROM context_entries e
-                    WHERE e.contact_id = c.id
-                      AND e.created_at >= strftime('%s','now') - 2592000
+                AND (
+                    EXISTS (
+                        SELECT 1 FROM notes n
+                        WHERE n.contact_id = c.id
+                          AND n.created_at >= strftime('%s','now') - 2592000
+                    )
+                    OR EXISTS (
+                        SELECT 1 FROM insights i
+                        WHERE i.contact_id = c.id
+                          AND i.updated_at >= strftime('%s','now') - 2592000
+                    )
+                    OR EXISTS (
+                        SELECT 1 FROM follow_ups f
+                        WHERE f.contact_id = c.id
+                          AND f.created_at >= strftime('%s','now') - 2592000
+                    )
                 )
                 """
             }
@@ -115,11 +127,11 @@ final class OrbitDatabase: @unchecked Sendable {
                 c.primary_phone,
                 c.city,
                 c.country,
-                (
-                    SELECT MAX(e.created_at)
-                    FROM context_entries e
-                    WHERE e.contact_id = c.id
-                ) AS last_context_at,
+                MAX(
+                    COALESCE((SELECT MAX(n.created_at) FROM notes n WHERE n.contact_id = c.id), 0),
+                    COALESCE((SELECT MAX(i.updated_at) FROM insights i WHERE i.contact_id = c.id), 0),
+                    COALESCE((SELECT MAX(f.created_at) FROM follow_ups f WHERE f.contact_id = c.id), 0)
+                ) AS last_activity_at,
                 (
                     SELECT MIN(f.due_at)
                     FROM follow_ups f
@@ -144,27 +156,35 @@ final class OrbitDatabase: @unchecked Sendable {
                 OR c.job_title LIKE ? COLLATE NOCASE
                 OR c.primary_email LIKE ? COLLATE NOCASE
                 OR EXISTS (
-                    SELECT 1 FROM context_entries e
-                    WHERE e.contact_id = c.id
-                      AND e.body LIKE ? COLLATE NOCASE
+                    SELECT 1 FROM notes n
+                    WHERE n.contact_id = c.id
+                      AND n.body LIKE ? COLLATE NOCASE
+                )
+                OR EXISTS (
+                    SELECT 1 FROM insights i
+                    WHERE i.contact_id = c.id
+                      AND i.body LIKE ? COLLATE NOCASE
                 )
             )
             \(filterClause)
             ORDER BY
                 CASE WHEN next_follow_up_at IS NULL THEN 1 ELSE 0 END,
                 next_follow_up_at ASC,
-                last_context_at DESC,
+                last_activity_at DESC,
                 c.display_name COLLATE NOCASE ASC;
             """
 
             let statement = try prepare(sql)
             defer { sqlite3_finalize(statement) }
-            for index in 1...5 {
+            for index in 1...6 {
                 try bindText(likeValue, to: Int32(index), in: statement)
             }
 
             var items: [ContactListItem] = []
             while sqlite3_step(statement) == SQLITE_ROW {
+                let lastActivityAt = optionalDate(at: 8, in: statement).flatMap {
+                    $0.timeIntervalSince1970 > 0 ? $0 : nil
+                }
                 items.append(
                     ContactListItem(
                         id: sqlite3_column_int64(statement, 0),
@@ -175,7 +195,7 @@ final class OrbitDatabase: @unchecked Sendable {
                         primaryPhone: optionalString(at: 5, in: statement),
                         city: optionalString(at: 6, in: statement),
                         country: optionalString(at: 7, in: statement),
-                        lastContextAt: optionalDate(at: 8, in: statement),
+                        lastActivityAt: lastActivityAt,
                         nextFollowUpAt: optionalDate(at: 9, in: statement),
                         openFollowUpCount: Int(sqlite3_column_int64(statement, 10)),
                         verificationStatus: ContactVerificationStatus(rawValue: string(at: 11, in: statement)) ?? .unverified,
@@ -192,68 +212,137 @@ final class OrbitDatabase: @unchecked Sendable {
             guard let core = try fetchContactCore(contactID: contactID) else {
                 return nil
             }
-            let timeline = try fetchContextEntries(contactID: contactID)
-            let followUps = try fetchFollowUps(contactID: contactID)
-            let facts = timeline.filter { $0.kind == .fact }.prefix(3).map(\.body)
+
             return OrbitContactBundle(
                 id: contactID,
                 core: core,
-                timeline: timeline,
-                followUps: followUps,
-                pinnedFacts: Array(facts)
+                notes: try fetchNotes(contactID: contactID),
+                insights: try fetchInsights(contactID: contactID),
+                followUps: try fetchFollowUps(contactID: contactID)
             )
         }
     }
 
-    nonisolated func addContextEntry(
-        contactID: Int64,
-        kind: ContextEntryKind,
-        title: String,
-        body: String,
-        provenance: ContextEntryProvenance
-    ) throws {
+    nonisolated func addNote(contactID: Int64, body: String, source: NoteSource) throws {
         try queue.sync {
             let sql = """
-            INSERT INTO context_entries (contact_id, kind, title, body, provenance, created_at)
-            VALUES (?, ?, ?, ?, ?, ?);
+            INSERT INTO notes (contact_id, body, source, created_at)
+            VALUES (?, ?, ?, ?);
             """
             let statement = try prepare(sql)
             defer { sqlite3_finalize(statement) }
             try bindInt64(contactID, to: 1, in: statement)
-            try bindText(kind.rawValue, to: 2, in: statement)
-            try bindText(title.nonEmpty, to: 3, in: statement)
-            try bindText(body, to: 4, in: statement)
-            try bindText(provenance.rawValue, to: 5, in: statement)
-            sqlite3_bind_double(statement, 6, Date().timeIntervalSince1970)
+            try bindText(body, to: 2, in: statement)
+            try bindText(source.rawValue, to: 3, in: statement)
+            sqlite3_bind_double(statement, 4, Date().timeIntervalSince1970)
             try stepDone(statement)
         }
     }
 
-    nonisolated func addFollowUp(contactID: Int64, title: String, note: String, dueAt: Date?) throws {
+    nonisolated func upsertInsight(
+        contactID: Int64,
+        insightID: Int64?,
+        body: String,
+        kind: InsightKind,
+        source: InsightSource
+    ) throws {
         try queue.sync {
-            let sql = """
-            INSERT INTO follow_ups (contact_id, title, note, due_at, created_at)
-            VALUES (?, ?, ?, ?, ?);
-            """
-            let statement = try prepare(sql)
-            defer { sqlite3_finalize(statement) }
-            try bindInt64(contactID, to: 1, in: statement)
-            try bindText(title, to: 2, in: statement)
-            try bindText(note.nonEmpty, to: 3, in: statement)
-            if let dueAt {
-                sqlite3_bind_double(statement, 4, dueAt.timeIntervalSince1970)
+            if let insightID {
+                let sql = """
+                UPDATE insights
+                SET body = ?, kind = ?, source = ?, updated_at = ?
+                WHERE id = ? AND contact_id = ?;
+                """
+                let statement = try prepare(sql)
+                defer { sqlite3_finalize(statement) }
+                try bindText(body, to: 1, in: statement)
+                try bindText(kind.rawValue, to: 2, in: statement)
+                try bindText(source.rawValue, to: 3, in: statement)
+                sqlite3_bind_double(statement, 4, Date().timeIntervalSince1970)
+                try bindInt64(insightID, to: 5, in: statement)
+                try bindInt64(contactID, to: 6, in: statement)
+                try stepDone(statement)
             } else {
-                sqlite3_bind_null(statement, 4)
+                let sql = """
+                INSERT INTO insights (contact_id, body, kind, source, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?);
+                """
+                let statement = try prepare(sql)
+                defer { sqlite3_finalize(statement) }
+                try bindInt64(contactID, to: 1, in: statement)
+                try bindText(body, to: 2, in: statement)
+                try bindText(kind.rawValue, to: 3, in: statement)
+                try bindText(source.rawValue, to: 4, in: statement)
+                let now = Date().timeIntervalSince1970
+                sqlite3_bind_double(statement, 5, now)
+                sqlite3_bind_double(statement, 6, now)
+                try stepDone(statement)
             }
-            sqlite3_bind_double(statement, 5, Date().timeIntervalSince1970)
+        }
+    }
+
+    nonisolated func deleteInsight(id: Int64) throws {
+        try queue.sync {
+            let statement = try prepare("DELETE FROM insights WHERE id = ?;")
+            defer { sqlite3_finalize(statement) }
+            try bindInt64(id, to: 1, in: statement)
             try stepDone(statement)
+        }
+    }
+
+    nonisolated func upsertFollowUp(
+        contactID: Int64,
+        followUpID: Int64?,
+        title: String,
+        note: String,
+        dueAt: Date?,
+        source: FollowUpSource
+    ) throws {
+        try queue.sync {
+            if let followUpID {
+                let sql = """
+                UPDATE follow_ups
+                SET title = ?, note = ?, due_at = ?, source = ?, completed_at = NULL
+                WHERE id = ? AND contact_id = ?;
+                """
+                let statement = try prepare(sql)
+                defer { sqlite3_finalize(statement) }
+                try bindText(title, to: 1, in: statement)
+                try bindText(note.nonEmpty, to: 2, in: statement)
+                if let dueAt {
+                    sqlite3_bind_double(statement, 3, dueAt.timeIntervalSince1970)
+                } else {
+                    sqlite3_bind_null(statement, 3)
+                }
+                try bindText(source.rawValue, to: 4, in: statement)
+                try bindInt64(followUpID, to: 5, in: statement)
+                try bindInt64(contactID, to: 6, in: statement)
+                try stepDone(statement)
+            } else {
+                let sql = """
+                INSERT INTO follow_ups (contact_id, title, note, due_at, source, created_at)
+                VALUES (?, ?, ?, ?, ?, ?);
+                """
+                let statement = try prepare(sql)
+                defer { sqlite3_finalize(statement) }
+                try bindInt64(contactID, to: 1, in: statement)
+                try bindText(title, to: 2, in: statement)
+                try bindText(note.nonEmpty, to: 3, in: statement)
+                if let dueAt {
+                    sqlite3_bind_double(statement, 4, dueAt.timeIntervalSince1970)
+                } else {
+                    sqlite3_bind_null(statement, 4)
+                }
+                try bindText(source.rawValue, to: 5, in: statement)
+                sqlite3_bind_double(statement, 6, Date().timeIntervalSince1970)
+                try stepDone(statement)
+            }
         }
     }
 
     nonisolated func completeFollowUp(id: Int64) throws {
         try queue.sync {
-            let sql = "UPDATE follow_ups SET completed_at = ? WHERE id = ?;"
-            let statement = try prepare(sql)
+            let statement = try prepare("UPDATE follow_ups SET completed_at = ? WHERE id = ?;")
             defer { sqlite3_finalize(statement) }
             sqlite3_bind_double(statement, 1, Date().timeIntervalSince1970)
             try bindInt64(id, to: 2, in: statement)
@@ -264,32 +353,44 @@ final class OrbitDatabase: @unchecked Sendable {
     nonisolated func contactPayload(contactID: Int64) throws -> [String: Any]? {
         try queue.sync {
             guard let core = try fetchContactCore(contactID: contactID) else { return nil }
-            let timeline = try fetchContextEntries(contactID: contactID)
+            let notes = try fetchNotes(contactID: contactID)
+            let insights = try fetchInsights(contactID: contactID)
             let followUps = try fetchFollowUps(contactID: contactID)
             let formatter = ISO8601DateFormatter()
 
             return [
-                "id": core.id,
-                "display_name": core.displayName,
-                "organization_name": core.organizationName,
-                "job_title": core.jobTitle,
-                "primary_email": core.primaryEmail as Any,
-                "primary_phone": core.primaryPhone as Any,
-                "verified_phone_e164": core.verifiedPhoneE164 as Any,
-                "verification_status": core.verificationStatus.rawValue,
-                "verified_display_name": core.verifiedDisplayName as Any,
-                "verification_note": core.verificationNote,
-                "verified_at": core.verifiedAt.map { formatter.string(from: $0) } as Any,
-                "city": core.city as Any,
-                "country": core.country as Any,
-                "timeline": timeline.map {
+                "today": formatter.string(from: .now),
+                "contact": [
+                    "id": core.id,
+                    "display_name": core.displayName,
+                    "organization_name": core.organizationName,
+                    "job_title": core.jobTitle,
+                    "primary_email": jsonValue(core.primaryEmail),
+                    "primary_phone": jsonValue(core.primaryPhone),
+                    "verified_phone_e164": jsonValue(core.verifiedPhoneE164),
+                    "verification_status": core.verificationStatus.rawValue,
+                    "verified_display_name": jsonValue(core.verifiedDisplayName),
+                    "verification_note": core.verificationNote,
+                    "verified_at": jsonValue(core.verifiedAt.map { formatter.string(from: $0) }),
+                    "city": jsonValue(core.city),
+                    "country": jsonValue(core.country)
+                ],
+                "notes": notes.map {
                     [
                         "id": $0.id,
-                        "kind": $0.kind.rawValue,
-                        "title": $0.title,
                         "body": $0.body,
-                        "provenance": $0.provenance.rawValue,
+                        "source": $0.source.rawValue,
                         "created_at": formatter.string(from: $0.createdAt)
+                    ]
+                },
+                "insights": insights.map {
+                    [
+                        "id": $0.id,
+                        "body": $0.body,
+                        "kind": $0.kind.rawValue,
+                        "source": $0.source.rawValue,
+                        "created_at": formatter.string(from: $0.createdAt),
+                        "updated_at": formatter.string(from: $0.updatedAt)
                     ]
                 },
                 "follow_ups": followUps.map {
@@ -297,11 +398,45 @@ final class OrbitDatabase: @unchecked Sendable {
                         "id": $0.id,
                         "title": $0.title,
                         "note": $0.note,
-                        "due_at": $0.dueAt.map { formatter.string(from: $0) } as Any,
-                        "completed_at": $0.completedAt.map { formatter.string(from: $0) } as Any
+                        "source": $0.source.rawValue,
+                        "due_at": jsonValue($0.dueAt.map { formatter.string(from: $0) }),
+                        "completed_at": jsonValue($0.completedAt.map { formatter.string(from: $0) }),
+                        "created_at": formatter.string(from: $0.createdAt)
                     ]
                 }
             ]
+        }
+    }
+
+    nonisolated func pendingFollowUpsPayload() throws -> [[String: Any]] {
+        try queue.sync {
+            let sql = """
+            SELECT f.id, f.contact_id, c.display_name, f.title, f.note, f.source, f.due_at, f.created_at
+            FROM follow_ups f
+            JOIN contacts c ON c.id = f.contact_id
+            WHERE f.completed_at IS NULL
+            ORDER BY
+                CASE WHEN f.due_at IS NULL THEN 1 ELSE 0 END,
+                f.due_at ASC,
+                f.created_at DESC;
+            """
+            let statement = try prepare(sql)
+            defer { sqlite3_finalize(statement) }
+            let formatter = ISO8601DateFormatter()
+            var items: [[String: Any]] = []
+            while sqlite3_step(statement) == SQLITE_ROW {
+                items.append([
+                    "id": sqlite3_column_int64(statement, 0),
+                    "contact_id": sqlite3_column_int64(statement, 1),
+                    "contact_name": string(at: 2, in: statement),
+                    "title": string(at: 3, in: statement),
+                    "note": optionalString(at: 4, in: statement) ?? "",
+                    "source": string(at: 5, in: statement),
+                    "due_at": jsonValue(optionalDate(at: 6, in: statement).map { formatter.string(from: $0) }),
+                    "created_at": jsonValue(optionalDate(at: 7, in: statement).map { formatter.string(from: $0) })
+                ])
+            }
+            return items
         }
     }
 
@@ -318,9 +453,7 @@ final class OrbitDatabase: @unchecked Sendable {
         let statement = try prepare(sql)
         defer { sqlite3_finalize(statement) }
         try bindInt64(contactID, to: 1, in: statement)
-        guard sqlite3_step(statement) == SQLITE_ROW else {
-            return nil
-        }
+        guard sqlite3_step(statement) == SQLITE_ROW else { return nil }
 
         let year = optionalInt(at: 11, in: statement)
         let month = optionalInt(at: 12, in: statement)
@@ -354,45 +487,68 @@ final class OrbitDatabase: @unchecked Sendable {
         )
     }
 
-    private func fetchContextEntries(contactID: Int64) throws -> [ContextEntry] {
-        let sql = """
-        SELECT id, contact_id, kind, title, body, provenance, created_at
-        FROM context_entries
+    private func fetchNotes(contactID: Int64) throws -> [OrbitNote] {
+        let statement = try prepare("""
+        SELECT id, contact_id, body, source, created_at
+        FROM notes
         WHERE contact_id = ?
         ORDER BY created_at DESC, id DESC;
-        """
-        let statement = try prepare(sql)
+        """)
         defer { sqlite3_finalize(statement) }
         try bindInt64(contactID, to: 1, in: statement)
 
-        var entries: [ContextEntry] = []
+        var notes: [OrbitNote] = []
         while sqlite3_step(statement) == SQLITE_ROW {
-            entries.append(
-                ContextEntry(
+            notes.append(
+                OrbitNote(
                     id: sqlite3_column_int64(statement, 0),
                     contactID: sqlite3_column_int64(statement, 1),
-                    kind: ContextEntryKind(rawValue: string(at: 2, in: statement)) ?? .note,
-                    title: optionalString(at: 3, in: statement) ?? "",
-                    body: string(at: 4, in: statement),
-                    provenance: ContextEntryProvenance(rawValue: string(at: 5, in: statement)) ?? .manual,
-                    createdAt: optionalDate(at: 6, in: statement) ?? .now
+                    body: string(at: 2, in: statement),
+                    source: NoteSource(rawValue: string(at: 3, in: statement)) ?? .manual,
+                    createdAt: optionalDate(at: 4, in: statement) ?? .now
                 )
             )
         }
-        return entries
+        return notes
+    }
+
+    private func fetchInsights(contactID: Int64) throws -> [Insight] {
+        let statement = try prepare("""
+        SELECT id, contact_id, body, kind, source, created_at, updated_at
+        FROM insights
+        WHERE contact_id = ?
+        ORDER BY updated_at DESC, id DESC;
+        """)
+        defer { sqlite3_finalize(statement) }
+        try bindInt64(contactID, to: 1, in: statement)
+
+        var insights: [Insight] = []
+        while sqlite3_step(statement) == SQLITE_ROW {
+            insights.append(
+                Insight(
+                    id: sqlite3_column_int64(statement, 0),
+                    contactID: sqlite3_column_int64(statement, 1),
+                    body: string(at: 2, in: statement),
+                    kind: InsightKind(rawValue: string(at: 3, in: statement)) ?? .general,
+                    source: InsightSource(rawValue: string(at: 4, in: statement)) ?? .agent,
+                    createdAt: optionalDate(at: 5, in: statement) ?? .now,
+                    updatedAt: optionalDate(at: 6, in: statement) ?? .now
+                )
+            )
+        }
+        return insights
     }
 
     private func fetchFollowUps(contactID: Int64) throws -> [FollowUpItem] {
-        let sql = """
-        SELECT id, contact_id, title, note, due_at, created_at, completed_at
+        let statement = try prepare("""
+        SELECT id, contact_id, title, note, due_at, source, created_at, completed_at
         FROM follow_ups
         WHERE contact_id = ?
         ORDER BY
             CASE WHEN completed_at IS NULL THEN 0 ELSE 1 END,
             due_at ASC,
             created_at DESC;
-        """
-        let statement = try prepare(sql)
+        """)
         defer { sqlite3_finalize(statement) }
         try bindInt64(contactID, to: 1, in: statement)
 
@@ -405,8 +561,9 @@ final class OrbitDatabase: @unchecked Sendable {
                     title: string(at: 2, in: statement),
                     note: optionalString(at: 3, in: statement) ?? "",
                     dueAt: optionalDate(at: 4, in: statement),
-                    createdAt: optionalDate(at: 5, in: statement) ?? .now,
-                    completedAt: optionalDate(at: 6, in: statement)
+                    source: FollowUpSource(rawValue: string(at: 5, in: statement)) ?? .agent,
+                    createdAt: optionalDate(at: 6, in: statement) ?? .now,
+                    completedAt: optionalDate(at: 7, in: statement)
                 )
             )
         }
@@ -414,7 +571,7 @@ final class OrbitDatabase: @unchecked Sendable {
     }
 
     private func upsert(snapshot: ContactSyncSnapshot) throws {
-        let sql = """
+        let statement = try prepare("""
         INSERT INTO contacts (
             apple_identifier, given_name, family_name, display_name,
             organization_name, job_title, primary_email, primary_phone,
@@ -436,9 +593,7 @@ final class OrbitDatabase: @unchecked Sendable {
             birthday_day = excluded.birthday_day,
             image_data = excluded.image_data,
             last_synced_at = excluded.last_synced_at;
-        """
-
-        let statement = try prepare(sql)
+        """)
         defer { sqlite3_finalize(statement) }
         try bindText(snapshot.identifier, to: 1, in: statement)
         try bindText(snapshot.givenName, to: 2, in: statement)
@@ -472,7 +627,7 @@ final class OrbitDatabase: @unchecked Sendable {
         verifiedAt: Date?
     ) throws {
         try queue.sync {
-            let sql = """
+            let statement = try prepare("""
             UPDATE contacts
             SET verification_status = ?,
                 verified_display_name = ?,
@@ -480,8 +635,7 @@ final class OrbitDatabase: @unchecked Sendable {
                 verification_note = ?,
                 verified_at = ?
             WHERE id = ?;
-            """
-            let statement = try prepare(sql)
+            """)
             defer { sqlite3_finalize(statement) }
             try bindText(status.rawValue, to: 1, in: statement)
             sqlite3_bind_null(statement, 2)
@@ -497,13 +651,9 @@ final class OrbitDatabase: @unchecked Sendable {
         }
     }
 
-    nonisolated func updateEnrichedImage(
-        contactID: Int64,
-        imageData: Data,
-        source: String
-    ) throws {
+    nonisolated func updateEnrichedImage(contactID: Int64, imageData: Data, source: String) throws {
         try queue.sync {
-            let sql = """
+            let statement = try prepare("""
             UPDATE contacts
             SET enriched_image_data = ?,
                 enriched_image_source = ?,
@@ -512,8 +662,7 @@ final class OrbitDatabase: @unchecked Sendable {
                     ELSE verification_status
                 END
             WHERE id = ?;
-            """
-            let statement = try prepare(sql)
+            """)
             defer { sqlite3_finalize(statement) }
             _ = imageData.withUnsafeBytes { rawBuffer in
                 sqlite3_bind_blob(statement, 1, rawBuffer.baseAddress, Int32(rawBuffer.count), SQLITE_TRANSIENT)
@@ -525,6 +674,8 @@ final class OrbitDatabase: @unchecked Sendable {
     }
 
     private func migrate() throws {
+        let schemaVersion = try currentSchemaVersion()
+
         try execute("""
         CREATE TABLE IF NOT EXISTS contacts (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -561,15 +712,37 @@ final class OrbitDatabase: @unchecked Sendable {
         try ensureContactsColumn(named: "verification_note", definition: "TEXT NOT NULL DEFAULT ''")
         try ensureContactsColumn(named: "verified_at", definition: "REAL")
 
+        if schemaVersion < 3 {
+            try execute("DROP TABLE IF EXISTS notes;")
+            try execute("DROP TABLE IF EXISTS insights;")
+            try execute("DROP TABLE IF EXISTS derived_facts;")
+            try execute("DROP TABLE IF EXISTS follow_ups;")
+            try execute("DROP TABLE IF EXISTS context_entries;")
+            try execute("DROP INDEX IF EXISTS idx_notes_contact_id_created_at;")
+            try execute("DROP INDEX IF EXISTS idx_insights_contact_id_updated_at;")
+            try execute("DROP INDEX IF EXISTS idx_derived_facts_contact_id_created_at;")
+            try execute("DROP INDEX IF EXISTS idx_follow_ups_contact_id_due_at;")
+        }
+
         try execute("""
-        CREATE TABLE IF NOT EXISTS context_entries (
+        CREATE TABLE IF NOT EXISTS notes (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             contact_id INTEGER NOT NULL REFERENCES contacts(id) ON DELETE CASCADE,
-            kind TEXT NOT NULL,
-            title TEXT,
             body TEXT NOT NULL,
-            provenance TEXT NOT NULL,
+            source TEXT NOT NULL,
             created_at REAL NOT NULL
+        );
+        """)
+
+        try execute("""
+        CREATE TABLE IF NOT EXISTS insights (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            contact_id INTEGER NOT NULL REFERENCES contacts(id) ON DELETE CASCADE,
+            body TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            source TEXT NOT NULL,
+            created_at REAL NOT NULL,
+            updated_at REAL NOT NULL
         );
         """)
 
@@ -580,6 +753,7 @@ final class OrbitDatabase: @unchecked Sendable {
             title TEXT NOT NULL,
             note TEXT,
             due_at REAL,
+            source TEXT NOT NULL,
             created_at REAL NOT NULL,
             completed_at REAL
         );
@@ -587,8 +761,17 @@ final class OrbitDatabase: @unchecked Sendable {
 
         try execute("CREATE INDEX IF NOT EXISTS idx_contacts_display_name ON contacts(display_name);")
         try execute("CREATE INDEX IF NOT EXISTS idx_contacts_verification_status ON contacts(verification_status);")
-        try execute("CREATE INDEX IF NOT EXISTS idx_context_entries_contact_id_created_at ON context_entries(contact_id, created_at DESC);")
+        try execute("CREATE INDEX IF NOT EXISTS idx_notes_contact_id_created_at ON notes(contact_id, created_at DESC);")
+        try execute("CREATE INDEX IF NOT EXISTS idx_insights_contact_id_updated_at ON insights(contact_id, updated_at DESC);")
         try execute("CREATE INDEX IF NOT EXISTS idx_follow_ups_contact_id_due_at ON follow_ups(contact_id, due_at);")
+        try execute("PRAGMA user_version = 3;")
+    }
+
+    private func currentSchemaVersion() throws -> Int {
+        let statement = try prepare("PRAGMA user_version;")
+        defer { sqlite3_finalize(statement) }
+        guard sqlite3_step(statement) == SQLITE_ROW else { return 0 }
+        return Int(sqlite3_column_int(statement, 0))
     }
 
     private func ensureContactsColumn(named name: String, definition: String) throws {
@@ -631,12 +814,12 @@ final class OrbitDatabase: @unchecked Sendable {
     }
 
     private func bindText(_ value: String?, to index: Int32, in statement: OpaquePointer?) throws {
-        if let value {
-            if sqlite3_bind_text(statement, index, value, -1, SQLITE_TRANSIENT) != SQLITE_OK {
-                throw OrbitDatabaseError.bindFailed(String(cString: sqlite3_errmsg(db)))
-            }
-        } else {
+        guard let value else {
             sqlite3_bind_null(statement, index)
+            return
+        }
+        if sqlite3_bind_text(statement, index, value, -1, SQLITE_TRANSIENT) != SQLITE_OK {
+            throw OrbitDatabaseError.bindFailed(String(cString: sqlite3_errmsg(db)))
         }
     }
 
@@ -647,13 +830,13 @@ final class OrbitDatabase: @unchecked Sendable {
     }
 
     private func string(at index: Int32, in statement: OpaquePointer?) -> String {
-        String(cString: sqlite3_column_text(statement, index))
+        guard let pointer = sqlite3_column_text(statement, index) else { return "" }
+        return String(cString: pointer)
     }
 
     private func optionalString(at index: Int32, in statement: OpaquePointer?) -> String? {
-        guard let pointer = sqlite3_column_text(statement, index) else { return nil }
-        let value = String(cString: pointer)
-        return value.isEmpty ? nil : value
+        guard sqlite3_column_type(statement, index) != SQLITE_NULL else { return nil }
+        return string(at: index, in: statement)
     }
 
     private func optionalInt(at index: Int32, in statement: OpaquePointer?) -> Int? {
@@ -671,8 +854,12 @@ final class OrbitDatabase: @unchecked Sendable {
               let bytes = sqlite3_column_blob(statement, index) else {
             return nil
         }
-        let count = Int(sqlite3_column_bytes(statement, index))
-        return Data(bytes: bytes, count: count)
+        let length = Int(sqlite3_column_bytes(statement, index))
+        return Data(bytes: bytes, count: length)
+    }
+
+    private func jsonValue(_ value: Any?) -> Any {
+        value ?? NSNull()
     }
 }
 

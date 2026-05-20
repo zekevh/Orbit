@@ -1,6 +1,7 @@
 import AppKit
 import Contacts
 import SwiftUI
+import UniformTypeIdentifiers
 
 struct ContentView: View {
     @EnvironmentObject private var model: OrbitAppModel
@@ -19,14 +20,10 @@ struct ContentView: View {
         .toolbarBackground(.hidden, for: .windowToolbar)
         .searchable(text: $model.searchText, placement: .toolbar, prompt: "Search Contacts")
         .onChange(of: model.searchText) { _, _ in
-            Task { @MainActor in
-                model.scheduleReloadList()
-            }
+            Task { @MainActor in model.scheduleReloadList() }
         }
         .onChange(of: model.selectedContactID) { _, _ in
-            Task { @MainActor in
-                model.scheduleReloadSelection()
-            }
+            Task { @MainActor in model.scheduleReloadSelection() }
         }
         .alert("Orbit", isPresented: Binding(
             get: { model.errorMessage != nil },
@@ -49,9 +46,7 @@ private struct SidebarView: View {
         }
         .listStyle(.sidebar)
         .onChange(of: model.selectedFilter) { _, _ in
-            Task { @MainActor in
-                model.scheduleReloadList()
-            }
+            Task { @MainActor in model.scheduleReloadList() }
         }
     }
 }
@@ -74,9 +69,7 @@ private struct ContactListView: View {
                 List(model.contacts, selection: Binding(
                     get: { model.selectedContactID },
                     set: { newValue in
-                        Task { @MainActor in
-                            model.setSelection(newValue)
-                        }
+                        Task { @MainActor in model.setSelection(newValue) }
                     }
                 )) { contact in
                     ContactRow(contact: contact)
@@ -143,9 +136,23 @@ private struct ContactDetailHost: View {
                 ContentUnavailableView(
                     "Select a Contact",
                     systemImage: "person.text.rectangle",
-                    description: Text("Orbit mirrors Apple Contacts and lets you enrich them with context and follow-ups.")
+                    description: Text("Orbit mirrors Apple Contacts and layers raw notes, insights, and follow-ups on top.")
                 )
             }
+        }
+    }
+}
+
+private enum ContactTab: String, CaseIterable, Identifiable {
+    case derived
+    case rawNotes
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .derived: "Derived"
+        case .rawNotes: "Raw Notes"
         }
     }
 }
@@ -155,179 +162,363 @@ private struct ContactDetailView: View {
     let bundle: OrbitContactBundle
 
     @State private var noteBody = ""
-    @State private var saveAsFact = false
-    @State private var followUpTitle = ""
-    @State private var followUpNote = ""
-    @State private var followUpDate = Date()
-    @State private var shouldSetDueDate = true
     @State private var appleDisplayName = ""
+    @State private var isImportingProfileImage = false
+    @State private var selectedTab: ContactTab = .derived
+    @State private var editingInsightID: Int64?
+    @State private var insightDraft = ""
+    @State private var insightKind: InsightKind = .general
 
     var body: some View {
         VStack(spacing: 0) {
             ContactIdentityHeader(
                 appleDisplayName: $appleDisplayName,
                 core: bundle.core,
-                pinnedFacts: bundle.pinnedFacts,
-                openWhatsApp: {
-                    model.openWhatsAppChat(contactID: bundle.id)
-                },
+                beginImageImport: { isImportingProfileImage = true },
+                openWhatsApp: { model.openWhatsAppChat(contactID: bundle.id) },
                 confirmVerification: {
-                    model.confirmVerification(
-                        contactID: bundle.id,
-                        appleDisplayName: appleDisplayName
-                    )
+                    model.confirmVerification(contactID: bundle.id, appleDisplayName: appleDisplayName)
                 },
-                unverify: {
-                    model.unverifyContact(contactID: bundle.id)
-                }
+                unverify: { model.unverifyContact(contactID: bundle.id) }
             )
+            .padding(.horizontal, 20)
+            .padding(.top, 20)
+            .padding(.bottom, 10)
+
+            VStack(spacing: 12) {
+                Picker("View", selection: $selectedTab) {
+                    ForEach(ContactTab.allCases) { tab in
+                        Text(tab.title).tag(tab)
+                    }
+                }
+                .pickerStyle(.segmented)
                 .padding(.horizontal, 20)
-                .padding(.top, 20)
-                .padding(.bottom, 10)
 
-            Form {
-                Section("Orbit Context") {
-                    TextField(
-                        "Add professional context, background, preferences, or anything Apple Contacts does not capture well",
-                        text: $noteBody,
-                        axis: .vertical
-                    )
-                    .lineLimit(4...8)
-
-                    Toggle("Pin this as an important fact", isOn: $saveAsFact)
-
-                    HStack {
-                        Spacer()
-                        Button("Add to Orbit") {
-                            let body = noteBody.trimmingCharacters(in: .whitespacesAndNewlines)
-                            guard !body.isEmpty else { return }
-                            model.addContextEntry(
-                                kind: saveAsFact ? .fact : .note,
-                                title: "",
-                                body: body
-                            )
-                            noteBody = ""
-                            saveAsFact = false
-                        }
-                        .buttonStyle(.borderedProminent)
-                    }
-                }
-
-                Section("Follow-Up") {
-                    TextField("What needs to happen?", text: $followUpTitle)
-                    TextField("Optional note", text: $followUpNote, axis: .vertical)
-                        .lineLimit(2...4)
-                    Toggle("Set due date", isOn: $shouldSetDueDate)
-                    if shouldSetDueDate {
-                        DatePicker("Due", selection: $followUpDate, displayedComponents: [.date, .hourAndMinute])
-                    }
-                    HStack {
-                        Spacer()
-                        Button("Create Follow-Up") {
-                            let title = followUpTitle.trimmingCharacters(in: .whitespacesAndNewlines)
-                            guard !title.isEmpty else { return }
-                            model.addFollowUp(
-                                title: title,
-                                note: followUpNote,
-                                dueAt: shouldSetDueDate ? followUpDate : nil
-                            )
-                            followUpTitle = ""
-                            followUpNote = ""
-                        }
-                        .buttonStyle(.bordered)
-                    }
-                }
-
-                Section("Open Follow-Ups") {
-                    if bundle.openFollowUps.isEmpty {
-                        Text("No pending follow-ups.")
-                            .foregroundStyle(.secondary)
-                    } else {
-                        ForEach(bundle.openFollowUps) { followUp in
-                            VStack(alignment: .leading, spacing: 6) {
-                                HStack {
-                                    Text(followUp.title)
-                                        .font(.headline)
-                                    Spacer()
-                                    Button("Done") {
-                                        model.completeFollowUp(id: followUp.id)
-                                    }
-                                }
-                                if !followUp.note.isEmpty {
-                                    Text(followUp.note)
-                                        .foregroundStyle(.secondary)
-                                }
-                                if let dueAt = followUp.dueAt {
-                                    Text(DateFormatter.orbitTimeline.string(from: dueAt))
-                                        .font(.caption)
-                                        .foregroundStyle(.secondary)
-                                }
-                            }
-                            .padding(.vertical, 2)
-                        }
-                    }
-                }
-
-                Section("Timeline") {
-                    if bundle.timeline.isEmpty {
-                        Text("No Orbit context yet.")
-                            .foregroundStyle(.secondary)
-                    } else {
-                        ForEach(bundle.timeline) { entry in
-                            VStack(alignment: .leading, spacing: 6) {
-                                HStack(alignment: .firstTextBaseline) {
-                                    Text(entry.kind == .fact ? "Fact" : "Note")
-                                        .font(.headline)
-                                    Spacer()
-                                    Text(entry.provenance.label)
-                                        .font(.caption)
-                                        .foregroundStyle(.secondary)
-                                    Text(DateFormatter.orbitTimeline.string(from: entry.createdAt))
-                                        .font(.caption)
-                                        .foregroundStyle(.secondary)
-                                }
-                                Text(entry.body)
-                                    .textSelection(.enabled)
-                            }
-                            .padding(.vertical, 2)
-                        }
+                Group {
+                    switch selectedTab {
+                    case .derived:
+                        DerivedContactView(
+                            bundle: bundle,
+                            editingInsightID: $editingInsightID,
+                            insightDraft: $insightDraft,
+                            insightKind: $insightKind,
+                            saveInsight: saveInsight,
+                            startEditingInsight: startEditingInsight,
+                            cancelEditingInsight: cancelEditingInsight,
+                            deleteInsight: deleteInsight,
+                            completeFollowUp: { model.completeFollowUp(id: $0) }
+                        )
+                    case .rawNotes:
+                        RawNotesView(
+                            bundle: bundle,
+                            noteBody: $noteBody,
+                            addNote: addNote
+                        )
                     }
                 }
             }
-            .formStyle(.grouped)
         }
         .onAppear {
             hydrateVerificationFields()
+            seedInsightEditorIfNeeded()
+        }
+        .fileImporter(
+            isPresented: $isImportingProfileImage,
+            allowedContentTypes: [.image],
+            allowsMultipleSelection: false
+        ) { result in
+            handleImportedProfileImage(result)
         }
         .onChange(of: bundle.id) { _, _ in
             hydrateVerificationFields()
+            resetEditors()
         }
         .onChange(of: bundle.core.verifiedAt) { _, _ in
             hydrateVerificationFields()
         }
     }
 
+    private func addNote() {
+        let body = noteBody.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !body.isEmpty else { return }
+        model.addNote(body)
+        noteBody = ""
+    }
+
+    private func saveInsight() {
+        let body = insightDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !body.isEmpty else { return }
+        model.upsertInsight(id: editingInsightID, body: body, kind: insightKind)
+        resetInsightEditor()
+    }
+
+    private func startEditingInsight(_ insight: Insight) {
+        editingInsightID = insight.id
+        insightDraft = insight.body
+        insightKind = insight.kind
+    }
+
+    private func cancelEditingInsight() {
+        resetInsightEditor()
+    }
+
+    private func deleteInsight(_ insightID: Int64) {
+        model.deleteInsight(id: insightID)
+        if editingInsightID == insightID {
+            resetInsightEditor()
+        }
+    }
+
+    private func resetInsightEditor() {
+        editingInsightID = nil
+        insightDraft = ""
+        insightKind = .general
+    }
+
+    private func resetEditors() {
+        noteBody = ""
+        resetInsightEditor()
+    }
+
+    private func seedInsightEditorIfNeeded() {
+        if editingInsightID == nil && insightDraft.isEmpty {
+            insightKind = .general
+        }
+    }
+
     private func hydrateVerificationFields() {
         appleDisplayName = bundle.core.displayName
+    }
+
+    private func handleImportedProfileImage(_ result: Result<[URL], Error>) {
+        do {
+            guard let url = try result.get().first else { return }
+            let accessedSecurityScopedResource = url.startAccessingSecurityScopedResource()
+            defer {
+                if accessedSecurityScopedResource {
+                    url.stopAccessingSecurityScopedResource()
+                }
+            }
+            let imageData = try Data(contentsOf: url, options: [.mappedIfSafe])
+            model.importVerificationImage(contactID: bundle.id, imageData: imageData, source: "manual_upload")
+        } catch {
+            model.errorMessage = error.localizedDescription
+        }
+    }
+}
+
+private struct DerivedContactView: View {
+    let bundle: OrbitContactBundle
+    @Binding var editingInsightID: Int64?
+    @Binding var insightDraft: String
+    @Binding var insightKind: InsightKind
+    let saveInsight: () -> Void
+    let startEditingInsight: (Insight) -> Void
+    let cancelEditingInsight: () -> Void
+    let deleteInsight: (Int64) -> Void
+    let completeFollowUp: (Int64) -> Void
+
+    var body: some View {
+        Form {
+            Section(editingInsightID == nil ? "New Insight" : "Edit Insight") {
+                Picker("Type", selection: $insightKind) {
+                    ForEach(InsightKind.allCases, id: \.self) { kind in
+                        Text(kind.title).tag(kind)
+                    }
+                }
+
+                TextField(
+                    "Add an interpreted insight, summary, fact, preference, relationship note, or priority",
+                    text: $insightDraft,
+                    axis: .vertical
+                )
+                .lineLimit(3...6)
+
+                HStack {
+                    if editingInsightID != nil {
+                        Button("Cancel", action: cancelEditingInsight)
+                    }
+                    Spacer()
+                    Button(editingInsightID == nil ? "Save Insight" : "Update Insight", action: saveInsight)
+                        .buttonStyle(.borderedProminent)
+                }
+            }
+
+            Section("Insights") {
+                if bundle.insights.isEmpty {
+                    Text("No insights yet.")
+                        .foregroundStyle(.secondary)
+                } else {
+                    ForEach(bundle.insights) { insight in
+                        VStack(alignment: .leading, spacing: 6) {
+                            HStack(alignment: .firstTextBaseline) {
+                                Text(insight.kind.title)
+                                    .font(.caption.weight(.semibold))
+                                    .foregroundStyle(.secondary)
+                                Spacer()
+                                Text(insight.source.label)
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                                Text(DateFormatter.orbitTimeline.string(from: insight.updatedAt))
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                            Text(insight.body)
+                                .textSelection(.enabled)
+                            HStack {
+                                Button("Edit") { startEditingInsight(insight) }
+                                Button("Delete", role: .destructive) { deleteInsight(insight.id) }
+                            }
+                            .controlSize(.small)
+                        }
+                        .padding(.vertical, 2)
+                    }
+                }
+            }
+
+            Section("Follow-Ups") {
+                if bundle.openFollowUps.isEmpty {
+                    Text("No pending follow-ups.")
+                        .foregroundStyle(.secondary)
+                } else {
+                    ForEach(bundle.openFollowUps) { followUp in
+                        VStack(alignment: .leading, spacing: 6) {
+                            HStack {
+                                Text(followUp.title)
+                                    .font(.headline)
+                                Spacer()
+                                Button("Done") { completeFollowUp(followUp.id) }
+                            }
+                            if !followUp.note.isEmpty {
+                                Text(followUp.note)
+                                    .foregroundStyle(.secondary)
+                            }
+                            HStack(spacing: 8) {
+                                Text(followUp.source.label)
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                                if let dueAt = followUp.dueAt {
+                                    Text(DateFormatter.orbitTimeline.string(from: dueAt))
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                }
+                            }
+                        }
+                        .padding(.vertical, 2)
+                    }
+                }
+            }
+
+            if !bundle.completedFollowUps.isEmpty {
+                Section("Completed Follow-Ups") {
+                    ForEach(bundle.completedFollowUps) { followUp in
+                        VStack(alignment: .leading, spacing: 6) {
+                            Text(followUp.title)
+                                .font(.headline)
+                            if !followUp.note.isEmpty {
+                                Text(followUp.note)
+                                    .foregroundStyle(.secondary)
+                            }
+                            HStack(spacing: 8) {
+                                Text(followUp.source.label)
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                                if let completedAt = followUp.completedAt {
+                                    Text("Completed \(DateFormatter.orbitTimeline.string(from: completedAt))")
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                }
+                            }
+                        }
+                        .padding(.vertical, 2)
+                    }
+                }
+            }
+        }
+        .formStyle(.grouped)
+    }
+}
+
+private struct RawNotesView: View {
+    let bundle: OrbitContactBundle
+    @Binding var noteBody: String
+    let addNote: () -> Void
+
+    var body: some View {
+        Form {
+            Section {
+                HStack(alignment: .bottom, spacing: 12) {
+                    TextEditor(text: $noteBody)
+                        .font(.body)
+                        .frame(minHeight: 110)
+                        .padding(8)
+                        .background(Color.secondary.opacity(0.08), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+
+                    Button(action: addNote) {
+                        Image(systemName: "plus")
+                            .font(.headline.weight(.semibold))
+                            .frame(width: 32, height: 32)
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(noteBody.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                    .help("Add note")
+                }
+            }
+
+            Section("Raw Notes") {
+                if bundle.notes.isEmpty {
+                    Text("No notes yet.")
+                        .foregroundStyle(.secondary)
+                } else {
+                    ForEach(bundle.notes) { note in
+                        VStack(alignment: .leading, spacing: 6) {
+                            HStack(alignment: .firstTextBaseline) {
+                                Text(note.source.label)
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                                Spacer()
+                                Text(DateFormatter.orbitTimeline.string(from: note.createdAt))
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                            Text(note.body)
+                                .textSelection(.enabled)
+                        }
+                        .padding(.vertical, 2)
+                    }
+                }
+            }
+        }
+        .formStyle(.grouped)
     }
 }
 
 private struct ContactIdentityHeader: View {
     @Binding var appleDisplayName: String
     let core: ContactCore
-    let pinnedFacts: [String]
+    let beginImageImport: () -> Void
     let openWhatsApp: () -> Void
     let confirmVerification: () -> Void
     let unverify: () -> Void
 
     var body: some View {
         HStack(alignment: .top, spacing: 18) {
-            ContactAvatar(core: core)
+            ContactAvatar(core: core, uploadImage: beginImageImport)
 
             VStack(alignment: .leading, spacing: 8) {
-                TextField("Contact name", text: $appleDisplayName)
-                    .font(.largeTitle)
-                    .textFieldStyle(.plain)
+                HStack(alignment: .firstTextBaseline, spacing: 10) {
+                    TextField("Contact name", text: $appleDisplayName)
+                        .font(.largeTitle)
+                        .textFieldStyle(.plain)
+
+                    VerificationStatusBadge(status: core.verificationStatus)
+
+                    if let verifiedAt = core.verifiedAt {
+                        Text(DateFormatter.orbitTimeline.string(from: verifiedAt))
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
 
                 if !core.roleLine.isEmpty {
                     Text(core.roleLine)
@@ -335,13 +526,9 @@ private struct ContactIdentityHeader: View {
                         .foregroundStyle(.secondary)
                 }
 
-                HStack(spacing: 14) {
+                VStack(alignment: .leading, spacing: 8) {
                     if let email = core.primaryEmail {
-                        CopyableContactValue(
-                            systemImage: "envelope",
-                            displayValue: email,
-                            copyValue: email
-                        )
+                        CopyableContactValue(systemImage: "envelope", displayValue: email, copyValue: email)
                     }
                     if let phone = core.primaryPhone {
                         CopyableContactValue(
@@ -353,25 +540,10 @@ private struct ContactIdentityHeader: View {
                 }
                 .font(.subheadline)
 
-                if !core.locationLine.isEmpty {
-                    Label(core.locationLine, systemImage: "mappin.and.ellipse")
-                        .font(.subheadline)
-                        .foregroundStyle(.secondary)
-                }
-
                 HStack(spacing: 10) {
-                    VerificationStatusBadge(status: core.verificationStatus)
-                    if let verifiedAt = core.verifiedAt {
-                        Text(DateFormatter.orbitTimeline.string(from: verifiedAt))
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    }
-                    Spacer()
-                    Button(action: openWhatsApp) {
-                        WhatsAppIcon()
-                    }
-                    .buttonStyle(.plain)
-                    .help("Open this contact in WhatsApp")
+                    Button(action: openWhatsApp) { WhatsAppIcon() }
+                        .buttonStyle(.plain)
+                        .help("Open this contact in WhatsApp")
                     if core.verificationStatus == .verified {
                         Button("Mark Unverified", action: unverify)
                             .buttonStyle(.bordered)
@@ -388,16 +560,10 @@ private struct ContactIdentityHeader: View {
                     }
                 }
 
-                if !pinnedFacts.isEmpty {
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text("Pinned Facts")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                        ForEach(pinnedFacts, id: \.self) { fact in
-                            Text("• \(fact)")
-                                .font(.subheadline)
-                        }
-                    }
+                if !core.locationLine.isEmpty {
+                    Label(core.locationLine, systemImage: "mappin.and.ellipse")
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
                 }
             }
         }
@@ -406,6 +572,8 @@ private struct ContactIdentityHeader: View {
 
 private struct ContactAvatar: View {
     let core: ContactCore
+    let uploadImage: () -> Void
+    @State private var isHovered = false
 
     private var initials: String {
         let fullName = [core.givenName, core.familyName]
@@ -418,28 +586,39 @@ private struct ContactAvatar: View {
     }
 
     var body: some View {
-        ZStack {
-            Circle()
-                .fill(.regularMaterial)
+        Button(action: uploadImage) {
+            ZStack {
+                Circle().fill(.regularMaterial)
 
-            if let data = core.resolvedImageData,
-               let image = NSImage(data: data) {
-                Image(nsImage: image)
-                    .resizable()
-                    .scaledToFill()
-            } else {
-                Text(initials)
-                    .font(.system(size: 34, weight: .semibold, design: .rounded))
-                    .foregroundStyle(.primary)
+                if let data = core.resolvedImageData, let image = NSImage(data: data) {
+                    Image(nsImage: image)
+                        .resizable()
+                        .scaledToFill()
+                } else {
+                    Text(initials)
+                        .font(.system(size: 34, weight: .semibold, design: .rounded))
+                        .foregroundStyle(.primary)
+                }
+
+                Circle().fill(.black.opacity(isHovered ? 0.28 : 0))
+
+                Image(systemName: "camera.fill")
+                    .font(.system(size: 18, weight: .semibold))
+                    .foregroundStyle(.white)
+                    .opacity(isHovered ? 1 : 0)
+                    .scaleEffect(isHovered ? 1 : 0.92)
+                    .animation(.easeOut(duration: 0.16), value: isHovered)
             }
         }
         .frame(width: 96, height: 96)
         .clipShape(Circle())
         .overlay {
-            Circle()
-                .strokeBorder(.white.opacity(0.35), lineWidth: 1)
+            Circle().strokeBorder(.white.opacity(0.35), lineWidth: 1)
         }
         .shadow(color: .black.opacity(0.08), radius: 10, y: 4)
+        .buttonStyle(.plain)
+        .help("Upload profile image")
+        .onHover { isHovered = $0 }
     }
 }
 
@@ -458,9 +637,7 @@ private struct CopyableContactValue: View {
             didCopy = true
             Task {
                 try? await Task.sleep(for: .milliseconds(1200))
-                await MainActor.run {
-                    didCopy = false
-                }
+                await MainActor.run { didCopy = false }
             }
         } label: {
             HStack(spacing: 6) {
@@ -476,9 +653,7 @@ private struct CopyableContactValue: View {
         }
         .buttonStyle(.plain)
         .help(didCopy ? "Copied" : "Click to copy")
-        .onHover { hovering in
-            isHovered = hovering
-        }
+        .onHover { isHovered = $0 }
     }
 }
 
@@ -496,12 +671,9 @@ private struct VerificationStatusBadge: View {
 
     private var backgroundColor: Color {
         switch status {
-        case .unverified:
-            .secondary
-        case .pendingReview:
-            .blue
-        case .verified:
-            .green
+        case .unverified: .secondary
+        case .pendingReview: .blue
+        case .verified: .green
         }
     }
 }
@@ -509,17 +681,14 @@ private struct VerificationStatusBadge: View {
 private struct WhatsAppIcon: View {
     var body: some View {
         ZStack {
-            Circle()
-                .fill(Color(red: 0.145, green: 0.8, blue: 0.427))
-
+            Circle().fill(Color(red: 0.145, green: 0.8, blue: 0.427))
             Image(systemName: "phone.fill")
                 .font(.system(size: 15, weight: .bold))
                 .foregroundStyle(.white)
         }
         .frame(width: 34, height: 34)
         .overlay {
-            Circle()
-                .strokeBorder(.white.opacity(0.3), lineWidth: 1)
+            Circle().strokeBorder(.white.opacity(0.3), lineWidth: 1)
         }
         .shadow(color: .black.opacity(0.08), radius: 6, y: 2)
     }
@@ -532,12 +701,10 @@ private struct RequestAccessView: View {
         ContentUnavailableView {
             Label("Connect Apple Contacts", systemImage: "person.crop.circle.badge.plus")
         } description: {
-            Text("Orbit mirrors your Apple contact identities, then lets you add richer professional context on top.")
+            Text("Orbit mirrors your Apple contact identities, then lets you add raw notes and derived insights on top.")
         } actions: {
-            Button("Grant Access") {
-                model.requestContactsAccess()
-            }
-            .buttonStyle(.borderedProminent)
+            Button("Grant Access") { model.requestContactsAccess() }
+                .buttonStyle(.borderedProminent)
         }
     }
 }

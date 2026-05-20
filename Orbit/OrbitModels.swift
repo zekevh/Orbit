@@ -1,5 +1,5 @@
-import Foundation
 import Contacts
+import Foundation
 import SwiftUI
 
 enum SidebarFilter: String, CaseIterable, Identifiable {
@@ -52,7 +52,7 @@ struct ContactListItem: Identifiable, Hashable {
     let primaryPhone: String?
     let city: String?
     let country: String?
-    let lastContextAt: Date?
+    let lastActivityAt: Date?
     let nextFollowUpAt: Date?
     let openFollowUpCount: Int
     let verificationStatus: ContactVerificationStatus
@@ -77,12 +77,16 @@ struct ContactListItem: Identifiable, Hashable {
 struct OrbitContactBundle: Identifiable {
     let id: Int64
     let core: ContactCore
-    let timeline: [ContextEntry]
+    let notes: [OrbitNote]
+    let insights: [Insight]
     let followUps: [FollowUpItem]
-    let pinnedFacts: [String]
 
     nonisolated var openFollowUps: [FollowUpItem] {
         followUps.filter { !$0.isCompleted }
+    }
+
+    nonisolated var completedFollowUps: [FollowUpItem] {
+        followUps.filter(\.isCompleted)
     }
 }
 
@@ -121,56 +125,90 @@ struct ContactCore: Identifiable {
     nonisolated var resolvedImageData: Data? {
         enrichedImageData ?? contactImageData
     }
-
-    nonisolated var effectiveDisplayName: String {
-        displayName
-    }
 }
 
-enum ContextEntryKind: String, CaseIterable, Codable {
-    case note
-    case fact
-    case meeting
-    case preference
-    case imported
-
-    static let captureKinds: [ContextEntryKind] = [.note, .fact]
-
-    var title: String {
-        switch self {
-        case .note: "Note"
-        case .fact: "Fact"
-        case .meeting: "Meeting"
-        case .preference: "Preference"
-        case .imported: "Imported"
-        }
-    }
-}
-
-enum ContextEntryProvenance: String, CaseIterable, Codable {
+enum NoteSource: String, CaseIterable, Codable {
     case manual
-    case agentWritten = "agent_written"
+    case agent
     case imported
-    case systemDerived = "system_derived"
+    case system
 
     var label: String {
         switch self {
         case .manual: "Manual"
-        case .agentWritten: "Agent"
+        case .agent: "Agent"
         case .imported: "Imported"
-        case .systemDerived: "Derived"
+        case .system: "System"
         }
     }
 }
 
-struct ContextEntry: Identifiable, Hashable {
+struct OrbitNote: Identifiable, Hashable {
     let id: Int64
     let contactID: Int64
-    let kind: ContextEntryKind
-    let title: String
     let body: String
-    let provenance: ContextEntryProvenance
+    let source: NoteSource
     let createdAt: Date
+}
+
+enum InsightKind: String, CaseIterable, Codable {
+    case general
+    case summary
+    case fact
+    case preference
+    case relationship
+    case priority
+
+    var title: String {
+        switch self {
+        case .general: "General"
+        case .summary: "Summary"
+        case .fact: "Fact"
+        case .preference: "Preference"
+        case .relationship: "Relationship"
+        case .priority: "Priority"
+        }
+    }
+}
+
+enum InsightSource: String, CaseIterable, Codable {
+    case human
+    case agent
+    case imported
+    case system
+
+    var label: String {
+        switch self {
+        case .human: "Human"
+        case .agent: "Agent"
+        case .imported: "Imported"
+        case .system: "System"
+        }
+    }
+}
+
+struct Insight: Identifiable, Hashable {
+    let id: Int64
+    let contactID: Int64
+    let body: String
+    let kind: InsightKind
+    let source: InsightSource
+    let createdAt: Date
+    let updatedAt: Date
+}
+
+enum FollowUpSource: String, CaseIterable, Codable {
+    case agent
+    case imported
+    case system
+
+    var label: String {
+        switch self {
+        case .agent: "Agent"
+        case .imported: "Imported"
+        case .system: "System"
+        }
+    }
 }
 
 struct FollowUpItem: Identifiable, Hashable {
@@ -179,6 +217,7 @@ struct FollowUpItem: Identifiable, Hashable {
     let title: String
     let note: String
     let dueAt: Date?
+    let source: FollowUpSource
     let createdAt: Date
     let completedAt: Date?
 

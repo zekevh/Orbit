@@ -86,15 +86,13 @@ final class OrbitAppModel: ObservableObject {
         isLoading = false
     }
 
-    func addContextEntry(kind: ContextEntryKind, title: String, body: String) {
+    func addNote(_ body: String) {
         guard let selectedContactID else { return }
         do {
-            try database.addContextEntry(
+            try database.addNote(
                 contactID: selectedContactID,
-                kind: kind,
-                title: title,
                 body: body,
-                provenance: .manual
+                source: .manual
             )
             scheduleReloadList(immediate: true)
         } catch {
@@ -102,10 +100,26 @@ final class OrbitAppModel: ObservableObject {
         }
     }
 
-    func addFollowUp(title: String, note: String, dueAt: Date?) {
+    func upsertInsight(id: Int64?, body: String, kind: InsightKind) {
         guard let selectedContactID else { return }
         do {
-            try database.addFollowUp(contactID: selectedContactID, title: title, note: note, dueAt: dueAt)
+            let source: InsightSource = id == nil ? .human : .human
+            try database.upsertInsight(
+                contactID: selectedContactID,
+                insightID: id,
+                body: body,
+                kind: kind,
+                source: source
+            )
+            scheduleReloadList(immediate: true)
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+    }
+
+    func deleteInsight(id: Int64) {
+        do {
+            try database.deleteInsight(id: id)
             scheduleReloadList(immediate: true)
         } catch {
             errorMessage = error.localizedDescription
@@ -170,15 +184,23 @@ final class OrbitAppModel: ObservableObject {
         errorMessage = "Orbit could not open WhatsApp for this contact."
     }
 
-    func importVerificationImage(contactID: Int64, imageData: Data, source: String = "manual_whatsapp") {
+    func importVerificationImage(contactID: Int64, imageData: Data, source: String = "manual_upload") {
         do {
             try database.updateEnrichedImage(contactID: contactID, imageData: imageData, source: source)
-            try database.addContextEntry(
+            let importTitle: String
+            let importBody: String
+            switch source {
+            case "manual_whatsapp":
+                importTitle = "WhatsApp Photo Imported"
+                importBody = "Imported a profile photo from WhatsApp for manual review."
+            default:
+                importTitle = "Profile Photo Imported"
+                importBody = "Imported a profile photo for manual review."
+            }
+            try database.addNote(
                 contactID: contactID,
-                kind: .imported,
-                title: "WhatsApp Photo Imported",
-                body: "Imported a profile photo from WhatsApp for manual review.",
-                provenance: .manual
+                body: "\(importTitle). \(importBody)",
+                source: .imported
             )
             scheduleReloadList(immediate: true)
         } catch {
@@ -219,12 +241,10 @@ final class OrbitAppModel: ObservableObject {
                     .compactMap { $0 }
                     .joined(separator: " ")
 
-                try database.addContextEntry(
+                try database.addNote(
                     contactID: contactID,
-                    kind: .imported,
-                    title: "WhatsApp Verification",
                     body: timelineNote,
-                    provenance: .manual
+                    source: .imported
                 )
 
                 // Verification can invalidate the current filter/search immediately
@@ -249,12 +269,10 @@ final class OrbitAppModel: ObservableObject {
                 note: "",
                 verifiedAt: nil
             )
-            try database.addContextEntry(
+            try database.addNote(
                 contactID: contactID,
-                kind: .imported,
-                title: "WhatsApp Verification Removed",
                 body: "Marked as unverified on \(DateFormatter.orbitTimeline.string(from: .now)).",
-                provenance: .manual
+                source: .imported
             )
             pendingVerificationPhoneE164 = nil
             scheduleReloadList(immediate: true)

@@ -2,10 +2,6 @@ import Foundation
 import MCP
 import Network
 
-private struct ContactToolPayload: Codable {
-    let items: [[String: String]]
-}
-
 actor OrbitMCPServer {
     static let port: UInt16 = 7475
 
@@ -19,12 +15,12 @@ actor OrbitMCPServer {
         self.database = database
         self.server = Server(
             name: "Orbit",
-            version: "0.1.0",
+            version: "0.3.0",
             instructions: """
-                Orbit exposes a local professional contact memory system. \
-                Use list_contacts for discovery, get_contact for full context, \
-                append_context_entry to write raw notes or facts, \
-                create_follow_up to set reminders, and complete_follow_up to close them.
+                Orbit exposes a local contact memory system for agents.
+                Humans write append-only raw notes. Agents should read contact context,
+                generate editable insights on top of those notes, and manage follow-ups.
+                Raw notes must not be overwritten.
                 """,
             capabilities: Server.Capabilities(tools: .init(listChanged: false))
         )
@@ -50,93 +46,88 @@ actor OrbitMCPServer {
             do {
                 switch params.name {
                 case "list_contacts":
-                    let search = params.arguments?["query"]?.stringValue ?? ""
-                    let items = try database.fetchContacts(filter: .allContacts, search: search)
-                    let payload = items.map { item in
+                    let query = params.arguments?["query"]?.stringValue ?? ""
+                    let items = try database.fetchContacts(filter: .allContacts, search: query)
+                    return Self.success(items.map {
                         [
-                            "id": String(item.id),
-                            "display_name": item.displayName,
-                            "subtitle": item.secondaryLine
+                            "id": String($0.id),
+                            "display_name": $0.displayName,
+                            "subtitle": $0.secondaryLine,
+                            "open_follow_up_count": String($0.openFollowUpCount)
                         ]
-                    }
-                    return CallTool.Result(
-                        content: [.text(text: Self.encode(payload), annotations: nil, _meta: nil)]
-                    )
+                    })
 
                 case "get_contact":
-                    guard let contactIDText = params.arguments?["contact_id"]?.stringValue,
-                          let contactID = Int64(contactIDText),
+                    guard let contactID = Self.contactID(from: params.arguments),
                           let payload = try database.contactPayload(contactID: contactID) else {
-                        return CallTool.Result(
-                            content: [.text(text: "Missing or unknown contact_id", annotations: nil, _meta: nil)],
-                            isError: true
-                        )
+                        return Self.error("Missing or unknown contact_id")
                     }
-                    return CallTool.Result(
-                        content: [.text(text: Self.encode(payload), annotations: nil, _meta: nil)]
-                    )
+                    return Self.success(payload)
 
-                case "append_context_entry":
-                    guard let contactIDText = params.arguments?["contact_id"]?.stringValue,
-                          let contactID = Int64(contactIDText),
+                case "list_pending_follow_ups":
+                    return Self.success(try database.pendingFollowUpsPayload())
+
+                case "append_note":
+                    guard let contactID = Self.contactID(from: params.arguments),
                           let body = params.arguments?["body"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines),
                           !body.isEmpty else {
-                        return CallTool.Result(
-                            content: [.text(text: "contact_id and body are required", annotations: nil, _meta: nil)],
-                            isError: true
-                        )
+                        return Self.error("contact_id and body are required")
                     }
-                    let title = params.arguments?["title"]?.stringValue ?? ""
-                    let kind = ContextEntryKind(rawValue: params.arguments?["kind"]?.stringValue ?? "") ?? .note
-                    try database.addContextEntry(
-                        contactID: contactID,
-                        kind: kind,
-                        title: title,
-                        body: body,
-                        provenance: .agentWritten
-                    )
-                    return CallTool.Result(
-                        content: [.text(text: "Added context entry to contact \(contactID)", annotations: nil, _meta: nil)]
-                    )
+                    let source = NoteSource(rawValue: params.arguments?["source"]?.stringValue ?? "") ?? .agent
+                    try database.addNote(contactID: contactID, body: body, source: source)
+                    return Self.message("Added note to contact \(contactID)")
 
-                case "create_follow_up":
-                    guard let contactIDText = params.arguments?["contact_id"]?.stringValue,
-                          let contactID = Int64(contactIDText),
+                case "upsert_insight":
+                    guard let contactID = Self.contactID(from: params.arguments),
+                          let body = params.arguments?["body"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines),
+                          !body.isEmpty else {
+                        return Self.error("contact_id and body are required")
+                    }
+                    let insightID = params.arguments?["insight_id"]?.stringValue.flatMap(Int64.init)
+                    let kind = InsightKind(rawValue: params.arguments?["kind"]?.stringValue ?? "") ?? .general
+                    let source = InsightSource(rawValue: params.arguments?["source"]?.stringValue ?? "") ?? .agent
+                    try database.upsertInsight(contactID: contactID, insightID: insightID, body: body, kind: kind, source: source)
+                    return Self.message(insightID == nil ? "Created insight for contact \(contactID)" : "Updated insight \(insightID!)")
+
+                case "delete_insight":
+                    guard let insightID = params.arguments?["insight_id"]?.stringValue.flatMap(Int64.init) else {
+                        return Self.error("insight_id is required")
+                    }
+                    try database.deleteInsight(id: insightID)
+                    return Self.message("Deleted insight \(insightID)")
+
+                case "upsert_follow_up":
+                    guard let contactID = Self.contactID(from: params.arguments),
                           let title = params.arguments?["title"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines),
                           !title.isEmpty else {
-                        return CallTool.Result(
-                            content: [.text(text: "contact_id and title are required", annotations: nil, _meta: nil)],
-                            isError: true
-                        )
+                        return Self.error("contact_id and title are required")
                     }
+                    let followUpID = params.arguments?["follow_up_id"]?.stringValue.flatMap(Int64.init)
                     let note = params.arguments?["note"]?.stringValue ?? ""
                     let dueAt = params.arguments?["due_at"]?.stringValue.flatMap(ISO8601DateFormatter().date(from:))
-                    try database.addFollowUp(contactID: contactID, title: title, note: note, dueAt: dueAt)
-                    return CallTool.Result(
-                        content: [.text(text: "Created follow-up for contact \(contactID)", annotations: nil, _meta: nil)]
+                    let source = FollowUpSource(rawValue: params.arguments?["source"]?.stringValue ?? "") ?? .agent
+                    try database.upsertFollowUp(
+                        contactID: contactID,
+                        followUpID: followUpID,
+                        title: title,
+                        note: note,
+                        dueAt: dueAt,
+                        source: source
                     )
+                    return Self.message(followUpID == nil ? "Created follow-up for contact \(contactID)" : "Updated follow-up \(followUpID!)")
 
                 case "complete_follow_up":
-                    guard let followUpIDText = params.arguments?["follow_up_id"]?.stringValue,
-                          let followUpID = Int64(followUpIDText) else {
-                        return CallTool.Result(
-                            content: [.text(text: "follow_up_id is required", annotations: nil, _meta: nil)],
-                            isError: true
-                        )
+                    guard let followUpID = params.arguments?["follow_up_id"]?.stringValue.flatMap(Int64.init) else {
+                        return Self.error("follow_up_id is required")
                     }
                     try database.completeFollowUp(id: followUpID)
-                    return CallTool.Result(
-                        content: [.text(text: "Completed follow-up \(followUpID)", annotations: nil, _meta: nil)]
-                    )
+                    return Self.message("Completed follow-up \(followUpID)")
 
                 default:
                     throw MCPError.methodNotFound("Unknown tool: \(params.name)")
                 }
             } catch {
-                return CallTool.Result(
-                    content: [.text(text: error.localizedDescription, annotations: nil, _meta: nil)],
-                    isError: true
-                )
+                return Self.error(error.localizedDescription)
             }
         }
     }
@@ -144,7 +135,7 @@ actor OrbitMCPServer {
     private static let tools: [Tool] = [
         Tool(
             name: "list_contacts",
-            description: "Search Orbit contacts by name, company, title, or context text",
+            description: "Search Orbit contacts by name, company, title, raw note text, or insight text",
             inputSchema: .object([
                 "type": .string("object"),
                 "properties": .object([
@@ -158,7 +149,7 @@ actor OrbitMCPServer {
         ),
         Tool(
             name: "get_contact",
-            description: "Fetch one contact with full Orbit context timeline and follow-ups",
+            description: "Fetch one contact with profile, raw notes, editable insights, follow-ups, and today's timestamp",
             inputSchema: .object([
                 "type": .string("object"),
                 "properties": .object([
@@ -172,8 +163,16 @@ actor OrbitMCPServer {
             annotations: .init(readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false)
         ),
         Tool(
-            name: "append_context_entry",
-            description: "Append a raw note or fact to a contact without overwriting prior context",
+            name: "list_pending_follow_ups",
+            description: "List all open follow-ups across contacts",
+            inputSchema: .object([
+                "type": .string("object")
+            ]),
+            annotations: .init(readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false)
+        ),
+        Tool(
+            name: "append_note",
+            description: "Append a raw note to a contact without overwriting prior notes",
             inputSchema: .object([
                 "type": .string("object"),
                 "properties": .object([
@@ -181,17 +180,13 @@ actor OrbitMCPServer {
                         "type": .string("string"),
                         "description": .string("Orbit contact ID")
                     ]),
-                    "title": .object([
-                        "type": .string("string"),
-                        "description": .string("Optional short title")
-                    ]),
                     "body": .object([
                         "type": .string("string"),
-                        "description": .string("Raw context body")
+                        "description": .string("Raw note body")
                     ]),
-                    "kind": .object([
+                    "source": .object([
                         "type": .string("string"),
-                        "description": .string("note, fact, meeting, preference, or imported")
+                        "description": .string("agent, imported, or system")
                     ])
                 ]),
                 "required": .array([.string("contact_id"), .string("body")])
@@ -199,14 +194,64 @@ actor OrbitMCPServer {
             annotations: .init(readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false)
         ),
         Tool(
-            name: "create_follow_up",
-            description: "Create a follow-up reminder for a contact",
+            name: "upsert_insight",
+            description: "Create or update an editable interpreted insight for a contact",
             inputSchema: .object([
                 "type": .string("object"),
                 "properties": .object([
                     "contact_id": .object([
                         "type": .string("string"),
                         "description": .string("Orbit contact ID")
+                    ]),
+                    "insight_id": .object([
+                        "type": .string("string"),
+                        "description": .string("Optional insight ID to update")
+                    ]),
+                    "body": .object([
+                        "type": .string("string"),
+                        "description": .string("Insight text")
+                    ]),
+                    "kind": .object([
+                        "type": .string("string"),
+                        "description": .string("general, summary, fact, preference, relationship, or priority")
+                    ]),
+                    "source": .object([
+                        "type": .string("string"),
+                        "description": .string("human, agent, imported, or system")
+                    ])
+                ]),
+                "required": .array([.string("contact_id"), .string("body")])
+            ]),
+            annotations: .init(readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false)
+        ),
+        Tool(
+            name: "delete_insight",
+            description: "Delete one editable insight",
+            inputSchema: .object([
+                "type": .string("object"),
+                "properties": .object([
+                    "insight_id": .object([
+                        "type": .string("string"),
+                        "description": .string("Insight ID")
+                    ])
+                ]),
+                "required": .array([.string("insight_id")])
+            ]),
+            annotations: .init(readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false)
+        ),
+        Tool(
+            name: "upsert_follow_up",
+            description: "Create or update an agent-managed follow-up for a contact",
+            inputSchema: .object([
+                "type": .string("object"),
+                "properties": .object([
+                    "contact_id": .object([
+                        "type": .string("string"),
+                        "description": .string("Orbit contact ID")
+                    ]),
+                    "follow_up_id": .object([
+                        "type": .string("string"),
+                        "description": .string("Optional follow-up ID to update")
                     ]),
                     "title": .object([
                         "type": .string("string"),
@@ -219,6 +264,10 @@ actor OrbitMCPServer {
                     "due_at": .object([
                         "type": .string("string"),
                         "description": .string("Optional ISO8601 due date")
+                    ]),
+                    "source": .object([
+                        "type": .string("string"),
+                        "description": .string("agent, imported, or system")
                     ])
                 ]),
                 "required": .array([.string("contact_id"), .string("title")])
@@ -241,6 +290,22 @@ actor OrbitMCPServer {
             annotations: .init(readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false)
         )
     ]
+
+    private static func contactID(from arguments: [String: Value]?) -> Int64? {
+        arguments?["contact_id"]?.stringValue.flatMap(Int64.init)
+    }
+
+    private static func success(_ payload: Any) -> CallTool.Result {
+        CallTool.Result(content: [.text(text: encode(payload), annotations: nil, _meta: nil)])
+    }
+
+    private static func message(_ text: String) -> CallTool.Result {
+        CallTool.Result(content: [.text(text: text, annotations: nil, _meta: nil)])
+    }
+
+    private static func error(_ text: String) -> CallTool.Result {
+        CallTool.Result(content: [.text(text: text, annotations: nil, _meta: nil)], isError: true)
+    }
 
     private static func encode(_ payload: Any) -> String {
         guard JSONSerialization.isValidJSONObject(payload),
@@ -319,65 +384,73 @@ actor OrbitMCPServer {
             guard let headerString = String(data: headerData, encoding: .utf8) else { return nil }
             let lines = headerString.components(separatedBy: "\r\n")
             guard let requestLine = lines.first else { return nil }
-            let parts = requestLine.split(separator: " ", maxSplits: 2).map(String.init)
+            let parts = requestLine.split(separator: " ")
             guard parts.count >= 2 else { return nil }
 
+            let method = String(parts[0])
+            let path = String(parts[1])
             var headers: [String: String] = [:]
-            for line in lines.dropFirst() where !line.isEmpty {
-                guard let colon = line.firstIndex(of: ":") else { continue }
-                let key = String(line[..<colon]).trimmingCharacters(in: .whitespaces)
-                let value = String(line[line.index(after: colon)...]).trimmingCharacters(in: .whitespaces)
-                headers[key] = value
+            for line in lines.dropFirst() {
+                guard let colonIndex = line.firstIndex(of: ":") else { continue }
+                let name = String(line[..<colonIndex]).trimmingCharacters(in: .whitespaces)
+                let value = String(line[line.index(after: colonIndex)...]).trimmingCharacters(in: .whitespaces)
+                headers[name] = value
             }
 
-            let contentLength = Int(headers["Content-Length"] ?? headers["content-length"] ?? "") ?? 0
-            var body = Data(buffer[split.upperBound...])
+            let bodyStart = split.upperBound
+            let contentLength = Int(headers["Content-Length"] ?? "") ?? 0
+            let remaining = buffer[bodyStart...]
+            var body = Data(remaining)
             while body.count < contentLength {
-                guard let more = await receive(from: connection) else { return nil }
-                body.append(more)
+                guard let chunk = await receive(from: connection) else { return nil }
+                body.append(chunk)
+            }
+            if body.count > contentLength {
+                body = body.prefix(contentLength)
             }
 
-            return HTTPRequest(
-                method: parts[0],
-                headers: headers,
-                body: contentLength > 0 ? Data(body.prefix(contentLength)) : nil,
-                path: parts[1]
-            )
+            return HTTPRequest(method: method, headers: headers, body: body, path: path)
         }
     }
 
     private func receive(from connection: NWConnection) async -> Data? {
         await withCheckedContinuation { continuation in
-            connection.receive(minimumIncompleteLength: 1, maximumLength: 65_536) { data, _, _, _ in
-                continuation.resume(returning: data.flatMap { $0.isEmpty ? nil : Optional($0) })
+            connection.receive(minimumIncompleteLength: 1, maximumLength: 64 * 1024) { data, _, isComplete, error in
+                if let data, !data.isEmpty {
+                    continuation.resume(returning: data)
+                } else if isComplete || error != nil {
+                    continuation.resume(returning: nil)
+                } else {
+                    continuation.resume(returning: nil)
+                }
             }
         }
     }
 
     private func writeHead(statusCode: Int, headers: [String: String], to connection: NWConnection) async {
-        let phrase: String
-        switch statusCode {
-        case 200: phrase = "OK"
-        case 202: phrase = "Accepted"
-        case 400: phrase = "Bad Request"
-        case 404: phrase = "Not Found"
-        case 405: phrase = "Method Not Allowed"
-        default: phrase = "Error"
-        }
-        var response = "HTTP/1.1 \(statusCode) \(phrase)\r\n"
-        for (key, value) in headers {
-            response += "\(key): \(value)\r\n"
+        var response = "HTTP/1.1 \(statusCode) \(Self.reasonPhrase(for: statusCode))\r\n"
+        for (name, value) in headers {
+            response += "\(name): \(value)\r\n"
         }
         response += "\r\n"
         _ = await write(Data(response.utf8), to: connection)
     }
 
-    @discardableResult
     private func write(_ data: Data, to connection: NWConnection) async -> Bool {
         await withCheckedContinuation { continuation in
             connection.send(content: data, completion: .contentProcessed { error in
                 continuation.resume(returning: error == nil)
             })
+        }
+    }
+
+    private static func reasonPhrase(for statusCode: Int) -> String {
+        switch statusCode {
+        case 200: return "OK"
+        case 400: return "Bad Request"
+        case 404: return "Not Found"
+        case 500: return "Internal Server Error"
+        default: return "OK"
         }
     }
 }
@@ -386,26 +459,24 @@ enum OrbitMCPServerError: LocalizedError {
     case listenerStartupFailed(NWError)
     case genericStartupFailed(String)
 
-    var isPortInUse: Bool {
-        switch self {
-        case .listenerStartupFailed(let error):
-            return String(describing: error).contains("EADDRINUSE")
-        case .genericStartupFailed:
-            return false
-        }
-    }
-
     var errorDescription: String? {
         switch self {
         case .listenerStartupFailed(let error):
-            switch error {
-            case .posix(let posixError) where posixError == .EADDRINUSE:
-                "Orbit's local MCP port is already in use. The app will continue without the local MCP server."
-            default:
-                "Orbit could not start its local MCP server: \(error)"
-            }
+            "Could not start local listener: \(error)"
         case .genericStartupFailed(let message):
-            "Orbit could not start its local MCP server: \(message)"
+            message
+        }
+    }
+
+    var isPortInUse: Bool {
+        switch self {
+        case .listenerStartupFailed(let error):
+            if case .posix(let posixError) = error {
+                return posixError == .EADDRINUSE
+            }
+            return false
+        case .genericStartupFailed:
+            return false
         }
     }
 }
