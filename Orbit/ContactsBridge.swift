@@ -64,4 +64,42 @@ final class ContactsBridge {
             try fetchSnapshots()
         }.value
     }
+
+    nonisolated func updateDisplayName(contactIdentifier: String, displayName: String) throws {
+        guard authorizationStatus == .authorized else {
+            throw ContactsBridgeError.accessDenied
+        }
+
+        let keys: [CNKeyDescriptor] = [
+            CNContactIdentifierKey as CNKeyDescriptor,
+            CNContactGivenNameKey as CNKeyDescriptor,
+            CNContactMiddleNameKey as CNKeyDescriptor,
+            CNContactFamilyNameKey as CNKeyDescriptor,
+            CNContactNamePrefixKey as CNKeyDescriptor,
+            CNContactNameSuffixKey as CNKeyDescriptor
+        ]
+
+        let contact = try store.unifiedContact(withIdentifier: contactIdentifier, keysToFetch: keys)
+        guard let mutableContact = contact.mutableCopy() as? CNMutableContact else { return }
+
+        let trimmed = displayName.trimmingCharacters(in: .whitespacesAndNewlines)
+        let formatter = PersonNameComponentsFormatter()
+        if let components = formatter.personNameComponents(from: trimmed) {
+            mutableContact.namePrefix = components.namePrefix ?? ""
+            mutableContact.givenName = components.givenName ?? ""
+            mutableContact.middleName = components.middleName ?? ""
+            mutableContact.familyName = components.familyName ?? ""
+            mutableContact.nameSuffix = components.nameSuffix ?? ""
+        } else {
+            mutableContact.namePrefix = ""
+            mutableContact.givenName = trimmed
+            mutableContact.middleName = ""
+            mutableContact.familyName = ""
+            mutableContact.nameSuffix = ""
+        }
+
+        let request = CNSaveRequest()
+        request.update(mutableContact)
+        try store.execute(request)
+    }
 }

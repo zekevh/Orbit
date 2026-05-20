@@ -77,6 +77,14 @@ final class OrbitDatabase: @unchecked Sendable {
             switch filter {
             case .allContacts:
                 filterClause = ""
+            case .needsVerification:
+                filterClause = """
+                AND c.primary_phone IS NOT NULL
+                AND TRIM(c.primary_phone) != ''
+                AND c.verification_status != 'verified'
+                AND c.image_data IS NULL
+                AND c.enriched_image_data IS NULL
+                """
             case .needsFollowUp:
                 filterClause = """
                 AND EXISTS (
@@ -123,7 +131,12 @@ final class OrbitDatabase: @unchecked Sendable {
                     FROM follow_ups f
                     WHERE f.contact_id = c.id
                       AND f.completed_at IS NULL
-                ) AS open_follow_up_count
+                ) AS open_follow_up_count,
+                c.verification_status,
+                CASE
+                    WHEN c.enriched_image_data IS NOT NULL OR c.image_data IS NOT NULL THEN 1
+                    ELSE 0
+                END AS has_any_image
             FROM contacts c
             WHERE (
                 c.display_name LIKE ? COLLATE NOCASE
@@ -164,7 +177,9 @@ final class OrbitDatabase: @unchecked Sendable {
                         country: optionalString(at: 7, in: statement),
                         lastContextAt: optionalDate(at: 8, in: statement),
                         nextFollowUpAt: optionalDate(at: 9, in: statement),
-                        openFollowUpCount: Int(sqlite3_column_int64(statement, 10))
+                        openFollowUpCount: Int(sqlite3_column_int64(statement, 10)),
+                        verificationStatus: ContactVerificationStatus(rawValue: string(at: 11, in: statement)) ?? .unverified,
+                        hasAnyImage: sqlite3_column_int64(statement, 12) != 0
                     )
                 )
             }
@@ -260,6 +275,11 @@ final class OrbitDatabase: @unchecked Sendable {
                 "job_title": core.jobTitle,
                 "primary_email": core.primaryEmail as Any,
                 "primary_phone": core.primaryPhone as Any,
+                "verified_phone_e164": core.verifiedPhoneE164 as Any,
+                "verification_status": core.verificationStatus.rawValue,
+                "verified_display_name": core.verifiedDisplayName as Any,
+                "verification_note": core.verificationNote,
+                "verified_at": core.verifiedAt.map { formatter.string(from: $0) } as Any,
                 "city": core.city as Any,
                 "country": core.country as Any,
                 "timeline": timeline.map {
@@ -289,7 +309,9 @@ final class OrbitDatabase: @unchecked Sendable {
         let sql = """
         SELECT id, apple_identifier, given_name, family_name, display_name, organization_name,
                job_title, primary_email, primary_phone, city, country, birthday_year,
-               birthday_month, birthday_day, image_data, last_synced_at
+               birthday_month, birthday_day, image_data, enriched_image_data,
+               enriched_image_source, verified_display_name, verified_phone_e164,
+               verification_status, verification_note, verified_at, last_synced_at
         FROM contacts
         WHERE id = ?;
         """
@@ -321,7 +343,14 @@ final class OrbitDatabase: @unchecked Sendable {
             country: optionalString(at: 10, in: statement),
             birthday: birthday,
             contactImageData: optionalData(at: 14, in: statement),
-            lastSyncedAt: optionalDate(at: 15, in: statement) ?? .now
+            enrichedImageData: optionalData(at: 15, in: statement),
+            enrichedImageSource: optionalString(at: 16, in: statement),
+            verifiedDisplayName: optionalString(at: 17, in: statement),
+            verifiedPhoneE164: optionalString(at: 18, in: statement),
+            verificationStatus: ContactVerificationStatus(rawValue: string(at: 19, in: statement)) ?? .unverified,
+            verificationNote: optionalString(at: 20, in: statement) ?? "",
+            verifiedAt: optionalDate(at: 21, in: statement),
+            lastSyncedAt: optionalDate(at: 22, in: statement) ?? .now
         )
     }
 
@@ -435,6 +464,66 @@ final class OrbitDatabase: @unchecked Sendable {
         try stepDone(statement)
     }
 
+    nonisolated func updateVerificationStatus(
+        contactID: Int64,
+        status: ContactVerificationStatus,
+        verifiedPhoneE164: String?,
+        note: String,
+        verifiedAt: Date?
+    ) throws {
+        try queue.sync {
+            let sql = """
+            UPDATE contacts
+            SET verification_status = ?,
+                verified_display_name = ?,
+                verified_phone_e164 = ?,
+                verification_note = ?,
+                verified_at = ?
+            WHERE id = ?;
+            """
+            let statement = try prepare(sql)
+            defer { sqlite3_finalize(statement) }
+            try bindText(status.rawValue, to: 1, in: statement)
+            sqlite3_bind_null(statement, 2)
+            try bindText(verifiedPhoneE164?.nonEmpty, to: 3, in: statement)
+            try bindText(note, to: 4, in: statement)
+            if let verifiedAt {
+                sqlite3_bind_double(statement, 5, verifiedAt.timeIntervalSince1970)
+            } else {
+                sqlite3_bind_null(statement, 5)
+            }
+            try bindInt64(contactID, to: 6, in: statement)
+            try stepDone(statement)
+        }
+    }
+
+    nonisolated func updateEnrichedImage(
+        contactID: Int64,
+        imageData: Data,
+        source: String
+    ) throws {
+        try queue.sync {
+            let sql = """
+            UPDATE contacts
+            SET enriched_image_data = ?,
+                enriched_image_source = ?,
+                verification_status = CASE
+                    WHEN verification_status = 'unverified' THEN 'pending_review'
+                    ELSE verification_status
+                END
+            WHERE id = ?;
+            """
+            let statement = try prepare(sql)
+            defer { sqlite3_finalize(statement) }
+            _ = imageData.withUnsafeBytes { rawBuffer in
+                sqlite3_bind_blob(statement, 1, rawBuffer.baseAddress, Int32(rawBuffer.count), SQLITE_TRANSIENT)
+            }
+            try bindText(source, to: 2, in: statement)
+            try bindInt64(contactID, to: 3, in: statement)
+            try stepDone(statement)
+        }
+    }
+
     private func migrate() throws {
         try execute("""
         CREATE TABLE IF NOT EXISTS contacts (
@@ -453,9 +542,24 @@ final class OrbitDatabase: @unchecked Sendable {
             birthday_month INTEGER,
             birthday_day INTEGER,
             image_data BLOB,
+            enriched_image_data BLOB,
+            enriched_image_source TEXT,
+            verified_display_name TEXT,
+            verified_phone_e164 TEXT,
+            verification_status TEXT NOT NULL DEFAULT 'unverified',
+            verification_note TEXT NOT NULL DEFAULT '',
+            verified_at REAL,
             last_synced_at REAL NOT NULL
         );
         """)
+
+        try ensureContactsColumn(named: "enriched_image_data", definition: "BLOB")
+        try ensureContactsColumn(named: "enriched_image_source", definition: "TEXT")
+        try ensureContactsColumn(named: "verified_display_name", definition: "TEXT")
+        try ensureContactsColumn(named: "verified_phone_e164", definition: "TEXT")
+        try ensureContactsColumn(named: "verification_status", definition: "TEXT NOT NULL DEFAULT 'unverified'")
+        try ensureContactsColumn(named: "verification_note", definition: "TEXT NOT NULL DEFAULT ''")
+        try ensureContactsColumn(named: "verified_at", definition: "REAL")
 
         try execute("""
         CREATE TABLE IF NOT EXISTS context_entries (
@@ -482,8 +586,25 @@ final class OrbitDatabase: @unchecked Sendable {
         """)
 
         try execute("CREATE INDEX IF NOT EXISTS idx_contacts_display_name ON contacts(display_name);")
+        try execute("CREATE INDEX IF NOT EXISTS idx_contacts_verification_status ON contacts(verification_status);")
         try execute("CREATE INDEX IF NOT EXISTS idx_context_entries_contact_id_created_at ON context_entries(contact_id, created_at DESC);")
         try execute("CREATE INDEX IF NOT EXISTS idx_follow_ups_contact_id_due_at ON follow_ups(contact_id, due_at);")
+    }
+
+    private func ensureContactsColumn(named name: String, definition: String) throws {
+        guard try !contactsTableHasColumn(named: name) else { return }
+        try execute("ALTER TABLE contacts ADD COLUMN \(name) \(definition);")
+    }
+
+    private func contactsTableHasColumn(named name: String) throws -> Bool {
+        let statement = try prepare("PRAGMA table_info(contacts);")
+        defer { sqlite3_finalize(statement) }
+        while sqlite3_step(statement) == SQLITE_ROW {
+            if string(at: 1, in: statement) == name {
+                return true
+            }
+        }
+        return false
     }
 
     private func execute(_ sql: String) throws {

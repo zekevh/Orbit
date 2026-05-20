@@ -6,13 +6,13 @@
 	objectVersion = 77;
 	objects = {
 
-/* Begin PBXFileReference section */
-		1923140D2FB87183004C81A9 /* orbit.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = orbit.app; sourceTree = BUILT_PRODUCTS_DIR; };
-/* End PBXFileReference section */
-
 /* Begin PBXBuildFile section */
 		A10000012FB87200004C81A9 /* MCP in Frameworks */ = {isa = PBXBuildFile; productRef = A10000042FB87200004C81A9 /* MCP */; };
 /* End PBXBuildFile section */
+
+/* Begin PBXFileReference section */
+		1923140D2FB87183004C81A9 /* orbit.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = orbit.app; sourceTree = BUILT_PRODUCTS_DIR; };
+/* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
 		1923140F2FB87183004C81A9 /* Orbit */ = {
@@ -91,7 +91,7 @@
 					};
 				};
 			};
-			buildConfigurationList = 192314082FB87183004C81A9 /* Build configuration list for PBXProject "orbit" */;
+			buildConfigurationList = 192314082FB87183004C81A9 /* Build configuration list for PBXProject "Orbit" */;
 			developmentRegion = en;
 			hasScannedForEncodings = 0;
 			knownRegions = (
@@ -264,7 +264,7 @@
 				ENABLE_APP_SANDBOX = YES;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
-				INFOPLIST_KEY_NSContactsUsageDescription = "Orbit mirrors your Apple contacts so you can enrich them with professional context and follow-ups.";
+				INFOPLIST_KEY_NSContactsUsageDescription = "Orbit mirrors your Apple contacts so you can enrich them with professional context, WhatsApp-assisted verification, and follow-ups.";
 				INFOPLIST_KEY_NSHumanReadableCopyright = "";
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
@@ -295,7 +295,7 @@
 				ENABLE_APP_SANDBOX = YES;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
-				INFOPLIST_KEY_NSContactsUsageDescription = "Orbit mirrors your Apple contacts so you can enrich them with professional context and follow-ups.";
+				INFOPLIST_KEY_NSContactsUsageDescription = "Orbit mirrors your Apple contacts so you can enrich them with professional context, WhatsApp-assisted verification, and follow-ups.";
 				INFOPLIST_KEY_NSHumanReadableCopyright = "";
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
@@ -317,7 +317,7 @@
 /* End XCBuildConfiguration section */
 
 /* Begin XCConfigurationList section */
-		192314082FB87183004C81A9 /* Build configuration list for PBXProject "orbit" */ = {
+		192314082FB87183004C81A9 /* Build configuration list for PBXProject "Orbit" */ = {
 			isa = XCConfigurationList;
 			buildConfigurations = (
 				192314162FB87186004C81A9 /* Debug */,

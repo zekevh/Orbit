@@ -4,6 +4,7 @@ import SwiftUI
 
 enum SidebarFilter: String, CaseIterable, Identifiable {
     case allContacts
+    case needsVerification
     case needsFollowUp
     case recentActivity
 
@@ -12,6 +13,7 @@ enum SidebarFilter: String, CaseIterable, Identifiable {
     var title: String {
         switch self {
         case .allContacts: "All Contacts"
+        case .needsVerification: "Needs Verification"
         case .needsFollowUp: "Needs Follow-Up"
         case .recentActivity: "Recent Activity"
         }
@@ -20,8 +22,23 @@ enum SidebarFilter: String, CaseIterable, Identifiable {
     var systemImage: String {
         switch self {
         case .allContacts: "person.crop.rectangle.stack"
+        case .needsVerification: "person.crop.circle.badge.questionmark"
         case .needsFollowUp: "clock.badge.exclamationmark"
         case .recentActivity: "sparkles"
+        }
+    }
+}
+
+enum ContactVerificationStatus: String, CaseIterable, Codable {
+    case unverified
+    case pendingReview = "pending_review"
+    case verified
+
+    var title: String {
+        switch self {
+        case .unverified: "Unverified"
+        case .pendingReview: "Pending Review"
+        case .verified: "Verified"
         }
     }
 }
@@ -38,6 +55,8 @@ struct ContactListItem: Identifiable, Hashable {
     let lastContextAt: Date?
     let nextFollowUpAt: Date?
     let openFollowUpCount: Int
+    let verificationStatus: ContactVerificationStatus
+    let hasAnyImage: Bool
 
     nonisolated var monogram: String {
         let parts = displayName.split(separator: " ")
@@ -81,6 +100,13 @@ struct ContactCore: Identifiable {
     let country: String?
     let birthday: DateComponents?
     let contactImageData: Data?
+    let enrichedImageData: Data?
+    let enrichedImageSource: String?
+    let verifiedDisplayName: String?
+    let verifiedPhoneE164: String?
+    let verificationStatus: ContactVerificationStatus
+    let verificationNote: String
+    let verifiedAt: Date?
     let lastSyncedAt: Date
 
     nonisolated var roleLine: String {
@@ -91,6 +117,14 @@ struct ContactCore: Identifiable {
     nonisolated var locationLine: String {
         [city, country].compactMap { $0 }.joined(separator: ", ")
     }
+
+    nonisolated var resolvedImageData: Data? {
+        enrichedImageData ?? contactImageData
+    }
+
+    nonisolated var effectiveDisplayName: String {
+        displayName
+    }
 }
 
 enum ContextEntryKind: String, CaseIterable, Codable {
@@ -99,6 +133,8 @@ enum ContextEntryKind: String, CaseIterable, Codable {
     case meeting
     case preference
     case imported
+
+    static let captureKinds: [ContextEntryKind] = [.note, .fact]
 
     var title: String {
         switch self {

@@ -13,6 +13,7 @@ actor OrbitMCPServer {
     private let transport = StatefulHTTPServerTransport()
     private let server: Server
     private var listener: NWListener?
+    private var hasStarted = false
 
     init(database: OrbitDatabase) {
         self.database = database
@@ -30,11 +31,13 @@ actor OrbitMCPServer {
     }
 
     func start() async throws {
+        guard !hasStarted else { return }
         await registerHandlers()
         Task { [server, transport] in
             try await server.start(transport: transport)
         }
         try startListener()
+        hasStarted = true
     }
 
     private func registerHandlers() async {
@@ -252,8 +255,25 @@ actor OrbitMCPServer {
         let parameters = NWParameters.tcp
         parameters.allowLocalEndpointReuse = true
         guard let port = NWEndpoint.Port(rawValue: Self.port) else { return }
-        let listener = try NWListener(using: parameters, on: port)
+        let listener: NWListener
+        do {
+            listener = try NWListener(using: parameters, on: port)
+        } catch let error as NWError {
+            throw OrbitMCPServerError.listenerStartupFailed(error)
+        } catch {
+            throw OrbitMCPServerError.genericStartupFailed(error.localizedDescription)
+        }
         self.listener = listener
+        listener.stateUpdateHandler = { newState in
+            switch newState {
+            case .failed(let error):
+                NSLog("Orbit MCP listener failed: %@", String(describing: error))
+            case .cancelled:
+                NSLog("Orbit MCP listener cancelled")
+            default:
+                break
+            }
+        }
         listener.newConnectionHandler = { [weak self] connection in
             guard let self else { return }
             Task { await self.handleConnection(connection) }
@@ -358,6 +378,34 @@ actor OrbitMCPServer {
             connection.send(content: data, completion: .contentProcessed { error in
                 continuation.resume(returning: error == nil)
             })
+        }
+    }
+}
+
+enum OrbitMCPServerError: LocalizedError {
+    case listenerStartupFailed(NWError)
+    case genericStartupFailed(String)
+
+    var isPortInUse: Bool {
+        switch self {
+        case .listenerStartupFailed(let error):
+            return String(describing: error).contains("EADDRINUSE")
+        case .genericStartupFailed:
+            return false
+        }
+    }
+
+    var errorDescription: String? {
+        switch self {
+        case .listenerStartupFailed(let error):
+            switch error {
+            case .posix(let posixError) where posixError == .EADDRINUSE:
+                "Orbit's local MCP port is already in use. The app will continue without the local MCP server."
+            default:
+                "Orbit could not start its local MCP server: \(error)"
+            }
+        case .genericStartupFailed(let message):
+            "Orbit could not start its local MCP server: \(message)"
         }
     }
 }
