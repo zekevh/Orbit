@@ -12,10 +12,11 @@ enum ContactsBridgeError: LocalizedError {
     }
 }
 
+@MainActor
 final class ContactsBridge {
     private let store = CNContactStore()
 
-    nonisolated var authorizationStatus: CNAuthorizationStatus {
+    var authorizationStatus: CNAuthorizationStatus {
         CNContactStore.authorizationStatus(for: .contacts)
     }
 
@@ -31,7 +32,7 @@ final class ContactsBridge {
         }
     }
 
-    nonisolated func fetchSnapshots() throws -> [ContactSyncSnapshot] {
+    func fetchSnapshots() throws -> [ContactSyncSnapshot] {
         guard authorizationStatus == .authorized else {
             throw ContactsBridgeError.accessDenied
         }
@@ -59,13 +60,11 @@ final class ContactsBridge {
         return snapshots
     }
 
-    nonisolated func fetchSnapshotsAsync() async throws -> [ContactSyncSnapshot] {
-        try await Task.detached(priority: .userInitiated) { [self] in
-            try fetchSnapshots()
-        }.value
+    func fetchSnapshotsAsync() async throws -> [ContactSyncSnapshot] {
+        try fetchSnapshots()
     }
 
-    nonisolated func updateDisplayName(contactIdentifier: String, displayName: String) throws {
+    func updateDisplayName(contactIdentifier: String, displayName: String) throws {
         guard authorizationStatus == .authorized else {
             throw ContactsBridgeError.accessDenied
         }

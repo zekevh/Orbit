@@ -75,7 +75,7 @@ final class OrbitAppModel: ObservableObject {
 
         do {
             if authorizationStatus == .authorized {
-                let snapshots = try await contactsBridge.fetchSnapshotsAsync()
+                let snapshots = try contactsBridge.fetchSnapshots()
                 try database.syncContacts(snapshots)
             }
             scheduleReloadList(immediate: true)
@@ -217,12 +217,10 @@ final class OrbitAppModel: ObservableObject {
                 let didRenameAppleContact = trimmedName.nonEmpty != nil && trimmedName != bundle.core.displayName
 
                 if let newName = trimmedName.nonEmpty, newName != bundle.core.displayName {
-                    try await Task.detached(priority: .userInitiated) { [contactsBridge] in
-                        try contactsBridge.updateDisplayName(
-                            contactIdentifier: bundle.core.appleIdentifier,
-                            displayName: newName
-                        )
-                    }.value
+                    try contactsBridge.updateDisplayName(
+                        contactIdentifier: bundle.core.appleIdentifier,
+                        displayName: newName
+                    )
                     await refreshContactsFromStore()
                 }
 

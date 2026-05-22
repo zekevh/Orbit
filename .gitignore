@@ -2,3 +2,16 @@
 
 *.xcuserstate
 xcuserdata/
+.build-logs/
+.release-artifacts/
+
+# Secrets
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.cer
+*.mobileprovision
+secrets.json
+credentials.json

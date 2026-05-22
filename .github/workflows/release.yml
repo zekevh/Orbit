@@ -1,0 +1,90 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: [self-hosted, macos-26]
+    env:
+      SCHEME: orbit
+      CONFIGURATION: Release
+      TAP_REPO: zekevh/homebrew-tap
+      CASK_NAME: orbit
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build archive
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          echo "VERSION=${VERSION}" >> "$GITHUB_ENV"
+          xcodebuild archive \
+            -project Orbit.xcodeproj \
+            -scheme "$SCHEME" \
+            -configuration "$CONFIGURATION" \
+            -archivePath "$RUNNER_TEMP/Orbit.xcarchive" \
+            MARKETING_VERSION="$VERSION" \
+            CURRENT_PROJECT_VERSION="$(git rev-list --count HEAD)" \
+            CODE_SIGN_IDENTITY="-" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=YES
+
+      - name: Export app
+        run: |
+          xcodebuild -exportArchive \
+            -archivePath "$RUNNER_TEMP/Orbit.xcarchive" \
+            -exportPath "$RUNNER_TEMP/export" \
+            -exportOptionsPlist ExportOptions.plist
+
+      - name: Ad-hoc sign
+        run: |
+          codesign \
+            --sign - \
+            --deep \
+            --force \
+            --options runtime \
+            "$RUNNER_TEMP/export/Orbit.app"
+
+      - name: Create DMG
+        run: |
+          hdiutil create \
+            -volname "Orbit" \
+            -srcfolder "$RUNNER_TEMP/export/Orbit.app" \
+            -ov \
+            -format UDZO \
+            "$RUNNER_TEMP/Orbit-${VERSION}.dmg"
+          echo "DMG_PATH=$RUNNER_TEMP/Orbit-${VERSION}.dmg" >> "$GITHUB_ENV"
+
+      - name: Compute SHA256
+        run: |
+          echo "SHA256=$(shasum -a 256 "$DMG_PATH" | awk '{print $1}')" >> "$GITHUB_ENV"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ env.DMG_PATH }}
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Update Homebrew Tap
+        env:
+          TAP_GITHUB_TOKEN: ${{ secrets.TAP_GITHUB_TOKEN }}
+        run: |
+          git clone "https://x-access-token:${TAP_GITHUB_TOKEN}@github.com/${TAP_REPO}.git" "$RUNNER_TEMP/homebrew-tap"
+          CASK="$RUNNER_TEMP/homebrew-tap/Casks/${CASK_NAME}.rb"
+          sed -i '' "s/version \".*\"/version \"${VERSION}\"/" "$CASK"
+          sed -i '' "s/sha256 \".*\"/sha256 \"${SHA256}\"/" "$CASK"
+          cd "$RUNNER_TEMP/homebrew-tap"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add "Casks/${CASK_NAME}.rb"
+          git commit -m "chore(${CASK_NAME}): bump version to ${VERSION}"
+          git push

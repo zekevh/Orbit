@@ -1,0 +1,24 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+jobs:
+  build:
+    runs-on: [self-hosted, macos-26]
+    env:
+      SCHEME: orbit
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build
+        run: |
+          xcodebuild build \
+            -project Orbit.xcodeproj \
+            -scheme "$SCHEME" \
+            -destination 'platform=macOS'
