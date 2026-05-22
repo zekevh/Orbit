@@ -447,19 +447,14 @@ private struct RawNotesView: View {
     var body: some View {
         Form {
             Section {
-                HStack(alignment: .bottom, spacing: 12) {
+                HStack(alignment: .bottom, spacing: 8) {
                     TextEditor(text: $noteBody)
                         .font(.body)
                         .frame(minHeight: 110)
-                        .padding(8)
-                        .background(Color.secondary.opacity(0.08), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
 
-                    Button(action: addNote) {
-                        Image(systemName: "plus")
-                            .font(.headline.weight(.semibold))
-                            .frame(width: 32, height: 32)
-                    }
-                    .buttonStyle(.borderedProminent)
+                    Button("Add", systemImage: "plus", action: addNote)
+                        .labelStyle(.iconOnly)
+                        .controlSize(.regular)
                     .disabled(noteBody.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                     .help("Add note")
                 }
