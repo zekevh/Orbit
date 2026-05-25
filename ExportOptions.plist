@@ -6,11 +6,7 @@
     <string>mac-application</string>
     <key>signingStyle</key>
     <string>manual</string>
-    <key>signingCertificate</key>
-    <string>-</string>
     <key>stripSwiftSymbols</key>
     <true/>
-    <key>teamID</key>
-    <string></string>
 </dict>
 </plist>

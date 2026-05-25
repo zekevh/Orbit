@@ -49,3 +49,7 @@ Pushing a tag in the form `v1.0.0` triggers the release workflow in GitHub Actio
 Required GitHub secret:
 
 - `TAP_GITHUB_TOKEN`: token with push access to `zekevh/homebrew-tap`
+- `DEVELOPER_TEAM_ID`: Apple Developer team ID used for release signing
+- `DEVELOPER_IDENTITY`: Developer ID Application certificate common name
+
+Local release packaging also requires `DEVELOPER_TEAM_ID` and `DEVELOPER_IDENTITY`. The release app must be Developer ID signed so macOS preserves the Contacts entitlement in the shipped build.
