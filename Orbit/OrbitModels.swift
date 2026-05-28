@@ -7,6 +7,7 @@ enum SidebarFilter: String, CaseIterable, Identifiable {
     case needsVerification
     case needsFollowUp
     case recentActivity
+    case archived
 
     var id: String { rawValue }
 
@@ -16,6 +17,7 @@ enum SidebarFilter: String, CaseIterable, Identifiable {
         case .needsVerification: "Needs Verification"
         case .needsFollowUp: "Needs Follow-Up"
         case .recentActivity: "Recent Activity"
+        case .archived: "Archived"
         }
     }
 
@@ -25,6 +27,7 @@ enum SidebarFilter: String, CaseIterable, Identifiable {
         case .needsVerification: "person.crop.circle.badge.questionmark"
         case .needsFollowUp: "clock.badge.exclamationmark"
         case .recentActivity: "sparkles"
+        case .archived: "archivebox"
         }
     }
 }
@@ -57,6 +60,7 @@ struct ContactListItem: Identifiable, Hashable {
     let openFollowUpCount: Int
     let verificationStatus: ContactVerificationStatus
     let hasAnyImage: Bool
+    let isArchived: Bool
 
     nonisolated var monogram: String {
         let parts = displayName.split(separator: " ")
@@ -112,6 +116,8 @@ struct ContactCore: Identifiable {
     let verificationNote: String
     let verifiedAt: Date?
     let lastSyncedAt: Date
+    let isArchived: Bool
+    let archivedAt: Date?
 
     nonisolated var roleLine: String {
         let pieces = [jobTitle, organizationName].filter { !$0.isEmpty }

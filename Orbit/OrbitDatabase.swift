@@ -72,7 +72,11 @@ final class OrbitDatabase: @unchecked Sendable {
 
     nonisolated func fetchContacts(filter: SidebarFilter, search: String) throws -> [ContactListItem] {
         try queue.sync {
-            let likeValue = search.nonEmpty.map { "%\($0)%" } ?? "%"
+            let searchTerm = search.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty
+            let likeValue = searchTerm.map { "%\($0)%" }
+            let prefixLikeValue = searchTerm.map { "\($0)%" }
+            let wordPrefixLikeValue = searchTerm.map { "% \($0)%" }
+            let shouldSearchBodies = searchTerm.map { $0.count >= 3 } ?? false
             let filterClause: String
             switch filter {
             case .allContacts:
@@ -94,6 +98,7 @@ final class OrbitDatabase: @unchecked Sendable {
                 """
             case .recentActivity:
                 filterClause = """
+                AND c.is_archived = 0
                 AND (
                     EXISTS (
                         SELECT 1 FROM notes n
@@ -112,9 +117,120 @@ final class OrbitDatabase: @unchecked Sendable {
                     )
                 )
                 """
+            case .archived:
+                filterClause = "AND c.is_archived = 1"
+            }
+
+            let archiveClause: String
+            switch filter {
+            case .archived, .recentActivity:
+                archiveClause = ""
+            default:
+                archiveClause = "AND c.is_archived = 0"
+            }
+
+            if searchTerm == nil && filter != .recentActivity {
+                let sql = """
+                WITH follow_up_activity AS (
+                    SELECT
+                        contact_id,
+                        MAX(created_at) AS last_follow_up_at,
+                        MIN(CASE WHEN completed_at IS NULL THEN due_at END) AS next_follow_up_at,
+                        SUM(CASE WHEN completed_at IS NULL THEN 1 ELSE 0 END) AS open_follow_up_count
+                    FROM follow_ups
+                    GROUP BY contact_id
+                )
+                SELECT
+                    c.id,
+                    c.apple_identifier,
+                    c.display_name,
+                    COALESCE(NULLIF(TRIM(c.job_title || CASE
+                        WHEN c.job_title != '' AND c.organization_name != '' THEN ' at '
+                        ELSE ''
+                    END || c.organization_name), ''), '') AS subtitle,
+                    c.primary_email,
+                    c.primary_phone,
+                    c.city,
+                    c.country,
+                    COALESCE(fua.last_follow_up_at, 0) AS last_activity_at,
+                    fua.next_follow_up_at,
+                    COALESCE(fua.open_follow_up_count, 0) AS open_follow_up_count,
+                    c.verification_status,
+                    CASE
+                        WHEN c.enriched_image_data IS NOT NULL OR c.image_data IS NOT NULL THEN 1
+                        ELSE 0
+                    END AS has_any_image,
+                    c.is_archived
+                FROM contacts c
+                LEFT JOIN follow_up_activity fua ON fua.contact_id = c.id
+                WHERE 1 = 1
+                \(archiveClause)
+                \(filterClause)
+                ORDER BY
+                    CASE WHEN next_follow_up_at IS NULL THEN 1 ELSE 0 END,
+                    next_follow_up_at ASC,
+                    c.display_name COLLATE NOCASE ASC;
+                """
+
+                let statement = try prepare(sql)
+                defer { sqlite3_finalize(statement) }
+                return contactListItems(from: statement)
+            }
+
+            let searchClause: String
+            if searchTerm == nil {
+                searchClause = "1 = 1"
+            } else if shouldSearchBodies {
+                searchClause = """
+                (
+                    c.display_name LIKE ? COLLATE NOCASE
+                    OR c.organization_name LIKE ? COLLATE NOCASE
+                    OR c.job_title LIKE ? COLLATE NOCASE
+                    OR c.primary_email LIKE ? COLLATE NOCASE
+                    OR EXISTS (
+                        SELECT 1 FROM notes n
+                        WHERE n.contact_id = c.id
+                          AND n.body LIKE ? COLLATE NOCASE
+                    )
+                    OR EXISTS (
+                        SELECT 1 FROM insights i
+                        WHERE i.contact_id = c.id
+                          AND i.body LIKE ? COLLATE NOCASE
+                    )
+                )
+                """
+            } else {
+                searchClause = """
+                (
+                    c.display_name LIKE ? COLLATE NOCASE
+                    OR c.organization_name LIKE ? COLLATE NOCASE
+                    OR c.job_title LIKE ? COLLATE NOCASE
+                    OR c.primary_email LIKE ? COLLATE NOCASE
+                )
+                """
             }
 
             let sql = """
+            WITH
+                note_activity AS (
+                    SELECT contact_id, MAX(created_at) AS last_note_at
+                    FROM notes
+                    GROUP BY contact_id
+                ),
+                insight_activity AS (
+                    SELECT contact_id, MAX(updated_at) AS last_insight_at
+                    FROM insights
+                    GROUP BY contact_id
+                ),
+                follow_up_activity AS (
+                    SELECT
+                        contact_id,
+                        MAX(created_at) AS last_follow_up_at,
+                        MIN(CASE WHEN completed_at IS NULL THEN due_at END) AS next_follow_up_at,
+                        SUM(CASE WHEN completed_at IS NULL THEN 1 ELSE 0 END) AS open_follow_up_count
+                    FROM follow_ups
+                    GROUP BY contact_id
+                )
             SELECT
                 c.id,
                 c.apple_identifier,
@@ -128,46 +244,36 @@ final class OrbitDatabase: @unchecked Sendable {
                 c.city,
                 c.country,
                 MAX(
-                    COALESCE((SELECT MAX(n.created_at) FROM notes n WHERE n.contact_id = c.id), 0),
-                    COALESCE((SELECT MAX(i.updated_at) FROM insights i WHERE i.contact_id = c.id), 0),
-                    COALESCE((SELECT MAX(f.created_at) FROM follow_ups f WHERE f.contact_id = c.id), 0)
+                    COALESCE(na.last_note_at, 0),
+                    COALESCE(ia.last_insight_at, 0),
+                    COALESCE(fua.last_follow_up_at, 0)
                 ) AS last_activity_at,
-                (
-                    SELECT MIN(f.due_at)
-                    FROM follow_ups f
-                    WHERE f.contact_id = c.id
-                      AND f.completed_at IS NULL
-                ) AS next_follow_up_at,
-                (
-                    SELECT COUNT(*)
-                    FROM follow_ups f
-                    WHERE f.contact_id = c.id
-                      AND f.completed_at IS NULL
-                ) AS open_follow_up_count,
+                fua.next_follow_up_at,
+                COALESCE(fua.open_follow_up_count, 0) AS open_follow_up_count,
                 c.verification_status,
                 CASE
                     WHEN c.enriched_image_data IS NOT NULL OR c.image_data IS NOT NULL THEN 1
                     ELSE 0
-                END AS has_any_image
+                END AS has_any_image,
+                c.is_archived
             FROM contacts c
-            WHERE (
-                c.display_name LIKE ? COLLATE NOCASE
-                OR c.organization_name LIKE ? COLLATE NOCASE
-                OR c.job_title LIKE ? COLLATE NOCASE
-                OR c.primary_email LIKE ? COLLATE NOCASE
-                OR EXISTS (
-                    SELECT 1 FROM notes n
-                    WHERE n.contact_id = c.id
-                      AND n.body LIKE ? COLLATE NOCASE
-                )
-                OR EXISTS (
-                    SELECT 1 FROM insights i
-                    WHERE i.contact_id = c.id
-                      AND i.body LIKE ? COLLATE NOCASE
-                )
-            )
+            LEFT JOIN note_activity na ON na.contact_id = c.id
+            LEFT JOIN insight_activity ia ON ia.contact_id = c.id
+            LEFT JOIN follow_up_activity fua ON fua.contact_id = c.id
+            WHERE \(searchClause)
+            \(archiveClause)
             \(filterClause)
             ORDER BY
+                CASE
+                    WHEN ? IS NULL THEN 0
+                    WHEN c.display_name = ? COLLATE NOCASE THEN 0
+                    WHEN c.display_name LIKE ? COLLATE NOCASE THEN 1
+                    WHEN c.display_name LIKE ? COLLATE NOCASE THEN 2
+                    WHEN c.organization_name LIKE ? COLLATE NOCASE THEN 3
+                    WHEN c.job_title LIKE ? COLLATE NOCASE THEN 4
+                    WHEN c.primary_email LIKE ? COLLATE NOCASE THEN 5
+                    ELSE 6
+                END,
                 CASE WHEN next_follow_up_at IS NULL THEN 1 ELSE 0 END,
                 next_follow_up_at ASC,
                 last_activity_at DESC,
@@ -176,35 +282,56 @@ final class OrbitDatabase: @unchecked Sendable {
 
             let statement = try prepare(sql)
             defer { sqlite3_finalize(statement) }
-            for index in 1...6 {
-                try bindText(likeValue, to: Int32(index), in: statement)
+            if let likeValue {
+                let bindCount = shouldSearchBodies ? 6 : 4
+                for index in 1...bindCount {
+                    try bindText(likeValue, to: Int32(index), in: statement)
+                }
+                try bindText(searchTerm, to: Int32(bindCount + 1), in: statement)
+                try bindText(searchTerm, to: Int32(bindCount + 2), in: statement)
+                try bindText(prefixLikeValue, to: Int32(bindCount + 3), in: statement)
+                try bindText(wordPrefixLikeValue, to: Int32(bindCount + 4), in: statement)
+                try bindText(likeValue, to: Int32(bindCount + 5), in: statement)
+                try bindText(likeValue, to: Int32(bindCount + 6), in: statement)
+                try bindText(likeValue, to: Int32(bindCount + 7), in: statement)
+            } else {
+                for index in 1...7 {
+                    try bindText(nil, to: Int32(index), in: statement)
+                }
             }
 
             var items: [ContactListItem] = []
-            while sqlite3_step(statement) == SQLITE_ROW {
-                let lastActivityAt = optionalDate(at: 8, in: statement).flatMap {
-                    $0.timeIntervalSince1970 > 0 ? $0 : nil
-                }
-                items.append(
-                    ContactListItem(
-                        id: sqlite3_column_int64(statement, 0),
-                        appleIdentifier: string(at: 1, in: statement),
-                        displayName: string(at: 2, in: statement),
-                        subtitle: string(at: 3, in: statement),
-                        primaryEmail: optionalString(at: 4, in: statement),
-                        primaryPhone: optionalString(at: 5, in: statement),
-                        city: optionalString(at: 6, in: statement),
-                        country: optionalString(at: 7, in: statement),
-                        lastActivityAt: lastActivityAt,
-                        nextFollowUpAt: optionalDate(at: 9, in: statement),
-                        openFollowUpCount: Int(sqlite3_column_int64(statement, 10)),
-                        verificationStatus: ContactVerificationStatus(rawValue: string(at: 11, in: statement)) ?? .unverified,
-                        hasAnyImage: sqlite3_column_int64(statement, 12) != 0
-                    )
-                )
-            }
+            items = contactListItems(from: statement)
             return items
         }
+    }
+
+    private func contactListItems(from statement: OpaquePointer?) -> [ContactListItem] {
+        var items: [ContactListItem] = []
+        while sqlite3_step(statement) == SQLITE_ROW {
+            let lastActivityAt = optionalDate(at: 8, in: statement).flatMap {
+                $0.timeIntervalSince1970 > 0 ? $0 : nil
+            }
+            items.append(
+                ContactListItem(
+                    id: sqlite3_column_int64(statement, 0),
+                    appleIdentifier: string(at: 1, in: statement),
+                    displayName: string(at: 2, in: statement),
+                    subtitle: string(at: 3, in: statement),
+                    primaryEmail: optionalString(at: 4, in: statement),
+                    primaryPhone: optionalString(at: 5, in: statement),
+                    city: optionalString(at: 6, in: statement),
+                    country: optionalString(at: 7, in: statement),
+                    lastActivityAt: lastActivityAt,
+                    nextFollowUpAt: optionalDate(at: 9, in: statement),
+                    openFollowUpCount: Int(sqlite3_column_int64(statement, 10)),
+                    verificationStatus: ContactVerificationStatus(rawValue: string(at: 11, in: statement)) ?? .unverified,
+                    hasAnyImage: sqlite3_column_int64(statement, 12) != 0,
+                    isArchived: sqlite3_column_int64(statement, 13) != 0
+                )
+            )
+        }
+        return items
     }
 
     nonisolated func fetchContactBundle(contactID: Int64) throws -> OrbitContactBundle? {
@@ -372,6 +499,8 @@ final class OrbitDatabase: @unchecked Sendable {
                     "verified_display_name": jsonValue(core.verifiedDisplayName),
                     "verification_note": core.verificationNote,
                     "verified_at": jsonValue(core.verifiedAt.map { formatter.string(from: $0) }),
+                    "is_archived": core.isArchived,
+                    "archived_at": jsonValue(core.archivedAt.map { formatter.string(from: $0) }),
                     "city": jsonValue(core.city),
                     "country": jsonValue(core.country)
                 ],
@@ -415,6 +544,7 @@ final class OrbitDatabase: @unchecked Sendable {
             FROM follow_ups f
             JOIN contacts c ON c.id = f.contact_id
             WHERE f.completed_at IS NULL
+              AND c.is_archived = 0
             ORDER BY
                 CASE WHEN f.due_at IS NULL THEN 1 ELSE 0 END,
                 f.due_at ASC,
@@ -446,7 +576,8 @@ final class OrbitDatabase: @unchecked Sendable {
                job_title, primary_email, primary_phone, city, country, birthday_year,
                birthday_month, birthday_day, image_data, enriched_image_data,
                enriched_image_source, verified_display_name, verified_phone_e164,
-               verification_status, verification_note, verified_at, last_synced_at
+               verification_status, verification_note, verified_at, last_synced_at,
+               is_archived, archived_at
         FROM contacts
         WHERE id = ?;
         """
@@ -483,7 +614,9 @@ final class OrbitDatabase: @unchecked Sendable {
             verificationStatus: ContactVerificationStatus(rawValue: string(at: 19, in: statement)) ?? .unverified,
             verificationNote: optionalString(at: 20, in: statement) ?? "",
             verifiedAt: optionalDate(at: 21, in: statement),
-            lastSyncedAt: optionalDate(at: 22, in: statement) ?? .now
+            lastSyncedAt: optionalDate(at: 22, in: statement) ?? .now,
+            isArchived: sqlite3_column_int64(statement, 23) != 0,
+            archivedAt: optionalDate(at: 24, in: statement)
         )
     }
 
@@ -673,6 +806,26 @@ final class OrbitDatabase: @unchecked Sendable {
         }
     }
 
+    nonisolated func setContactArchived(contactID: Int64, isArchived: Bool) throws {
+        try queue.sync {
+            let statement = try prepare("""
+            UPDATE contacts
+            SET is_archived = ?,
+                archived_at = ?
+            WHERE id = ?;
+            """)
+            defer { sqlite3_finalize(statement) }
+            sqlite3_bind_int(statement, 1, isArchived ? 1 : 0)
+            if isArchived {
+                sqlite3_bind_double(statement, 2, Date().timeIntervalSince1970)
+            } else {
+                sqlite3_bind_null(statement, 2)
+            }
+            try bindInt64(contactID, to: 3, in: statement)
+            try stepDone(statement)
+        }
+    }
+
     private func migrate() throws {
         let schemaVersion = try currentSchemaVersion()
 
@@ -700,6 +853,8 @@ final class OrbitDatabase: @unchecked Sendable {
             verification_status TEXT NOT NULL DEFAULT 'unverified',
             verification_note TEXT NOT NULL DEFAULT '',
             verified_at REAL,
+            is_archived INTEGER NOT NULL DEFAULT 0,
+            archived_at REAL,
             last_synced_at REAL NOT NULL
         );
         """)
@@ -711,6 +866,8 @@ final class OrbitDatabase: @unchecked Sendable {
         try ensureContactsColumn(named: "verification_status", definition: "TEXT NOT NULL DEFAULT 'unverified'")
         try ensureContactsColumn(named: "verification_note", definition: "TEXT NOT NULL DEFAULT ''")
         try ensureContactsColumn(named: "verified_at", definition: "REAL")
+        try ensureContactsColumn(named: "is_archived", definition: "INTEGER NOT NULL DEFAULT 0")
+        try ensureContactsColumn(named: "archived_at", definition: "REAL")
 
         if schemaVersion < 3 {
             try execute("DROP TABLE IF EXISTS notes;")
@@ -761,6 +918,7 @@ final class OrbitDatabase: @unchecked Sendable {
 
         try execute("CREATE INDEX IF NOT EXISTS idx_contacts_display_name ON contacts(display_name);")
         try execute("CREATE INDEX IF NOT EXISTS idx_contacts_verification_status ON contacts(verification_status);")
+        try execute("CREATE INDEX IF NOT EXISTS idx_contacts_is_archived ON contacts(is_archived);")
         try execute("CREATE INDEX IF NOT EXISTS idx_notes_contact_id_created_at ON notes(contact_id, created_at DESC);")
         try execute("CREATE INDEX IF NOT EXISTS idx_insights_contact_id_updated_at ON insights(contact_id, updated_at DESC);")
         try execute("CREATE INDEX IF NOT EXISTS idx_follow_ups_contact_id_due_at ON follow_ups(contact_id, due_at);")

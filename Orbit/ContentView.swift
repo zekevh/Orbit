@@ -7,23 +7,31 @@ struct ContentView: View {
     @EnvironmentObject private var model: OrbitAppModel
 
     var body: some View {
-        NavigationSplitView(columnVisibility: $model.sidebarVisibility) {
-            SidebarView()
-                .navigationSplitViewColumnWidth(min: 180, ideal: 210, max: 250)
-        } content: {
-            ContactListView()
-                .navigationSplitViewColumnWidth(min: 260, ideal: 320, max: 420)
-        } detail: {
-            ContactDetailHost()
-        }
-        .navigationSplitViewStyle(.balanced)
-        .toolbarBackground(.hidden, for: .windowToolbar)
-        .searchable(text: $model.searchText, placement: .toolbar, prompt: "Search Contacts")
-        .onChange(of: model.searchText) { _, _ in
-            Task { @MainActor in model.scheduleReloadList() }
-        }
-        .onChange(of: model.selectedContactID) { _, _ in
-            Task { @MainActor in model.scheduleReloadSelection() }
+        Group {
+            if model.isPreparingInitialContacts {
+                InitialContactsLoadingView()
+            } else {
+                NavigationSplitView(columnVisibility: $model.sidebarVisibility) {
+                    SidebarView()
+                        .navigationSplitViewColumnWidth(min: 180, ideal: 210, max: 250)
+                } content: {
+                    ContactListView()
+                        .navigationSplitViewColumnWidth(min: 260, ideal: 320, max: 420)
+                } detail: {
+                    ContactDetailHost()
+                }
+                .navigationSplitViewStyle(.balanced)
+                .toolbarBackground(.hidden, for: .windowToolbar)
+                .searchable(text: $model.searchText, placement: .toolbar, prompt: "Search Contacts")
+                .onChange(of: model.searchText) { _, _ in
+                    Task { @MainActor in
+                        model.scheduleReloadList(immediate: model.searchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                    }
+                }
+                .onChange(of: model.selectedContactID) { _, _ in
+                    Task { @MainActor in model.scheduleReloadSelection() }
+                }
+            }
         }
         .alert("Orbit", isPresented: Binding(
             get: { model.errorMessage != nil },
@@ -33,6 +41,22 @@ struct ContentView: View {
         } message: {
             Text(model.errorMessage ?? "")
         }
+    }
+}
+
+private struct InitialContactsLoadingView: View {
+    var body: some View {
+        VStack(spacing: 14) {
+            ProgressView()
+                .controlSize(.large)
+            Text("Loading Contacts...")
+                .font(.headline)
+            Text("Orbit is preparing your Apple Contacts before opening the workspace.")
+                .font(.subheadline)
+                .foregroundStyle(.secondary)
+        }
+        .frame(minWidth: 720, minHeight: 480)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 }
 
@@ -64,7 +88,10 @@ private struct ContactListView: View {
                 ProgressView("Loading Contacts…")
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else if model.contacts.isEmpty {
-                ContentUnavailableView("No Contacts", systemImage: "person.crop.circle.badge.exclamationmark")
+                ContentUnavailableView(
+                    model.selectedFilter == .archived ? "No Archived Contacts" : "No Contacts",
+                    systemImage: model.selectedFilter == .archived ? "archivebox" : "person.crop.circle.badge.exclamationmark"
+                )
             } else {
                 List(model.contacts, selection: Binding(
                     get: { model.selectedContactID },
@@ -110,7 +137,11 @@ private struct ContactRow: View {
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
 
-                if contact.verificationStatus != .verified && !contact.hasAnyImage {
+                if contact.isArchived {
+                    Label("Archived", systemImage: "archivebox")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                } else if contact.verificationStatus != .verified && !contact.hasAnyImage {
                     Label(contact.verificationStatus.title, systemImage: "checkmark.shield")
                         .font(.caption)
                         .foregroundStyle(.blue)
@@ -168,6 +199,7 @@ private struct ContactDetailView: View {
     @State private var editingInsightID: Int64?
     @State private var insightDraft = ""
     @State private var insightKind: InsightKind = .general
+    @State private var isConfirmingArchive = false
 
     var body: some View {
         VStack(spacing: 0) {
@@ -179,7 +211,9 @@ private struct ContactDetailView: View {
                 confirmVerification: {
                     model.confirmVerification(contactID: bundle.id, appleDisplayName: appleDisplayName)
                 },
-                unverify: { model.unverifyContact(contactID: bundle.id) }
+                unverify: { model.unverifyContact(contactID: bundle.id) },
+                archive: { isConfirmingArchive = true },
+                restore: { model.restoreContact(contactID: bundle.id) }
             )
             .padding(.horizontal, 20)
             .padding(.top, 20)
@@ -235,6 +269,17 @@ private struct ContactDetailView: View {
         }
         .onChange(of: bundle.core.verifiedAt) { _, _ in
             hydrateVerificationFields()
+        }
+        .confirmationDialog(
+            "Archive Contact",
+            isPresented: $isConfirmingArchive
+        ) {
+            Button("Archive Contact", role: .destructive) {
+                model.archiveContact(contactID: bundle.id)
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("This hides the contact from normal lists but keeps Orbit notes, insights, and follow-ups available in Archived.")
         }
     }
 
@@ -495,6 +540,8 @@ private struct ContactIdentityHeader: View {
     let openWhatsApp: () -> Void
     let confirmVerification: () -> Void
     let unverify: () -> Void
+    let archive: () -> Void
+    let restore: () -> Void
 
     var body: some View {
         HStack(alignment: .top, spacing: 18) {
@@ -507,6 +554,12 @@ private struct ContactIdentityHeader: View {
                         .textFieldStyle(.plain)
 
                     VerificationStatusBadge(status: core.verificationStatus)
+
+                    if core.isArchived {
+                        Label("Archived", systemImage: "archivebox")
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(.secondary)
+                    }
 
                     if let verifiedAt = core.verifiedAt {
                         Text(DateFormatter.orbitTimeline.string(from: verifiedAt))
@@ -552,6 +605,16 @@ private struct ContactIdentityHeader: View {
                         Label(source.replacingOccurrences(of: "_", with: " ").capitalized, systemImage: "photo.badge.checkmark")
                             .font(.caption)
                             .foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                    if core.isArchived {
+                        Button("Restore", systemImage: "arrow.uturn.backward", action: restore)
+                            .buttonStyle(.bordered)
+                            .controlSize(.small)
+                    } else {
+                        Button("Archive", systemImage: "archivebox", action: archive)
+                            .buttonStyle(.bordered)
+                            .controlSize(.small)
                     }
                 }
 

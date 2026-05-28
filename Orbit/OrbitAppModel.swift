@@ -14,11 +14,16 @@ final class OrbitAppModel: ObservableObject {
     @Published var selectedBundle: OrbitContactBundle?
     @Published var authorizationStatus: CNAuthorizationStatus
     @Published var isLoading = false
+    @Published var hasCompletedInitialContactsLoad = false
     @Published var errorMessage: String?
     @Published var pendingVerificationPhoneE164: String?
 
     var contactListTitle: String {
         "\(contacts.count) Contact\(contacts.count == 1 ? "" : "s")"
+    }
+
+    var isPreparingInitialContacts: Bool {
+        authorizationStatus == .authorized && !hasCompletedInitialContactsLoad && errorMessage == nil
     }
 
     private let database: OrbitDatabase
@@ -28,6 +33,7 @@ final class OrbitAppModel: ObservableObject {
     private var pendingAutoRefreshTask: Task<Void, Never>?
     private var pendingListReloadTask: Task<Void, Never>?
     private var pendingSelectionReloadTask: Task<Void, Never>?
+    private var emptySearchContactCache: [SidebarFilter: [ContactListItem]] = [:]
 
     init() {
         do {
@@ -61,6 +67,7 @@ final class OrbitAppModel: ObservableObject {
                 let granted = try await contactsBridge.requestAccess()
                 authorizationStatus = contactsBridge.authorizationStatus
                 if granted {
+                    hasCompletedInitialContactsLoad = false
                     await refreshContactsFromStore()
                 }
             } catch {
@@ -77,8 +84,10 @@ final class OrbitAppModel: ObservableObject {
             if authorizationStatus == .authorized {
                 let snapshots = try contactsBridge.fetchSnapshots()
                 try database.syncContacts(snapshots)
+                emptySearchContactCache.removeAll()
             }
-            scheduleReloadList(immediate: true)
+            await reloadList(immediate: true)
+            hasCompletedInitialContactsLoad = true
         } catch {
             errorMessage = error.localizedDescription
         }
@@ -94,6 +103,7 @@ final class OrbitAppModel: ObservableObject {
                 body: body,
                 source: .manual
             )
+            emptySearchContactCache.removeAll()
             scheduleReloadList(immediate: true)
         } catch {
             errorMessage = error.localizedDescription
@@ -111,6 +121,7 @@ final class OrbitAppModel: ObservableObject {
                 kind: kind,
                 source: source
             )
+            emptySearchContactCache.removeAll()
             scheduleReloadList(immediate: true)
         } catch {
             errorMessage = error.localizedDescription
@@ -120,6 +131,7 @@ final class OrbitAppModel: ObservableObject {
     func deleteInsight(id: Int64) {
         do {
             try database.deleteInsight(id: id)
+            emptySearchContactCache.removeAll()
             scheduleReloadList(immediate: true)
         } catch {
             errorMessage = error.localizedDescription
@@ -129,6 +141,7 @@ final class OrbitAppModel: ObservableObject {
     func completeFollowUp(id: Int64) {
         do {
             try database.completeFollowUp(id: id)
+            emptySearchContactCache.removeAll()
             scheduleReloadList(immediate: true)
         } catch {
             errorMessage = error.localizedDescription
@@ -155,6 +168,7 @@ final class OrbitAppModel: ObservableObject {
                     note: bundle.core.verificationNote,
                     verifiedAt: bundle.core.verifiedAt
                 )
+                emptySearchContactCache.removeAll()
                 scheduleReloadList(immediate: true)
             } else {
                 scheduleReloadSelection()
@@ -202,6 +216,7 @@ final class OrbitAppModel: ObservableObject {
                 body: "\(importTitle). \(importBody)",
                 source: .imported
             )
+            emptySearchContactCache.removeAll()
             scheduleReloadList(immediate: true)
         } catch {
             errorMessage = error.localizedDescription
@@ -221,6 +236,7 @@ final class OrbitAppModel: ObservableObject {
                         contactIdentifier: bundle.core.appleIdentifier,
                         displayName: newName
                     )
+                    emptySearchContactCache.removeAll()
                     await refreshContactsFromStore()
                 }
 
@@ -244,6 +260,7 @@ final class OrbitAppModel: ObservableObject {
                     body: timelineNote,
                     source: .imported
                 )
+                emptySearchContactCache.removeAll()
 
                 // Verification can invalidate the current filter/search immediately
                 // (for example "Needs Verification" or the old display name), which
@@ -273,6 +290,27 @@ final class OrbitAppModel: ObservableObject {
                 source: .imported
             )
             pendingVerificationPhoneE164 = nil
+            emptySearchContactCache.removeAll()
+            scheduleReloadList(immediate: true)
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+    }
+
+    func archiveContact(contactID: Int64) {
+        do {
+            try database.setContactArchived(contactID: contactID, isArchived: true)
+            emptySearchContactCache.removeAll()
+            scheduleReloadList(immediate: true)
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+    }
+
+    func restoreContact(contactID: Int64) {
+        do {
+            try database.setContactArchived(contactID: contactID, isArchived: false)
+            emptySearchContactCache.removeAll()
             scheduleReloadList(immediate: true)
         } catch {
             errorMessage = error.localizedDescription
@@ -284,6 +322,17 @@ final class OrbitAppModel: ObservableObject {
         let search = searchText
         let currentSelection = selectedContactID
 
+        if search.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+           let cachedItems = emptySearchContactCache[filter] {
+            applyContactList(cachedItems, currentSelection: currentSelection)
+        } else if let cachedItems = emptySearchContactCache[filter] {
+            let cachedSearchResults = contactFieldSearchResults(
+                in: cachedItems,
+                search: search
+            )
+            applyContactList(cachedSearchResults, currentSelection: currentSelection)
+        }
+
         pendingListReloadTask?.cancel()
         pendingListReloadTask = Task { [weak self, database] in
             let delay: Duration = immediate ? .zero : .milliseconds(180)
@@ -293,18 +342,12 @@ final class OrbitAppModel: ObservableObject {
             guard !Task.isCancelled else { return }
 
             do {
-                let items = try await Task.detached(priority: .userInitiated) {
-                    try database.fetchContacts(filter: filter, search: search)
-                }.value
-                guard !Task.isCancelled, let self else { return }
-
-                self.contacts = items
-                if let currentSelection, items.contains(where: { $0.id == currentSelection }) {
-                    self.selectedContactID = currentSelection
-                } else {
-                    self.selectedContactID = items.first?.id
-                }
-                self.scheduleReloadSelection()
+                try await self?.loadContactsList(
+                    database: database,
+                    filter: filter,
+                    search: search,
+                    currentSelection: currentSelection
+                )
             } catch {
                 guard let self, !Task.isCancelled else { return }
                 self.errorMessage = error.localizedDescription
@@ -376,5 +419,124 @@ final class OrbitAppModel: ObservableObject {
             guard !Task.isCancelled, let self else { return }
             await self.refreshContactsFromStore()
         }
+    }
+
+    private func reloadList(immediate: Bool = false) async {
+        pendingListReloadTask?.cancel()
+
+        let filter = selectedFilter
+        let search = searchText
+        let currentSelection = selectedContactID
+        let delay: Duration = immediate ? .zero : .milliseconds(180)
+
+        if delay > .zero {
+            try? await Task.sleep(for: delay)
+        }
+        guard !Task.isCancelled else { return }
+
+        do {
+            try await loadContactsList(
+                database: database,
+                filter: filter,
+                search: search,
+                currentSelection: currentSelection
+            )
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+    }
+
+    private func loadContactsList(
+        database: OrbitDatabase,
+        filter: SidebarFilter,
+        search: String,
+        currentSelection: Int64?
+    ) async throws {
+        let isEmptySearch = search.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        let items = try await Task.detached(priority: .userInitiated) {
+            try database.fetchContacts(filter: filter, search: search)
+        }.value
+        guard !Task.isCancelled else { return }
+
+        if isEmptySearch {
+            emptySearchContactCache[filter] = items
+        }
+        applyContactList(items, currentSelection: currentSelection)
+    }
+
+    private func applyContactList(_ items: [ContactListItem], currentSelection: Int64?) {
+        let previousSelection = selectedContactID
+        contacts = items
+        let nextSelection: Int64?
+        if let currentSelection, items.contains(where: { $0.id == currentSelection }) {
+            nextSelection = currentSelection
+        } else {
+            nextSelection = items.first?.id
+        }
+
+        selectedContactID = nextSelection
+        if previousSelection != nextSelection || selectedBundle == nil {
+            scheduleReloadSelection()
+        }
+    }
+
+    private func contactFieldSearchResults(in items: [ContactListItem], search: String) -> [ContactListItem] {
+        let term = search.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !term.isEmpty else { return items }
+
+        return items
+            .filter { contact in
+                searchableContactFields(contact).contains { $0.contains(term) }
+            }
+            .sorted { lhs, rhs in
+                let lhsRank = contactSearchRank(lhs, term: term)
+                let rhsRank = contactSearchRank(rhs, term: term)
+                if lhsRank != rhsRank { return lhsRank < rhsRank }
+
+                let lhsFollowUp = lhs.nextFollowUpAt
+                let rhsFollowUp = rhs.nextFollowUpAt
+                switch (lhsFollowUp, rhsFollowUp) {
+                case let (lhsFollowUp?, rhsFollowUp?) where lhsFollowUp != rhsFollowUp:
+                    return lhsFollowUp < rhsFollowUp
+                case (_?, nil):
+                    return true
+                case (nil, _?):
+                    return false
+                default:
+                    break
+                }
+
+                if lhs.lastActivityAt != rhs.lastActivityAt {
+                    return (lhs.lastActivityAt ?? .distantPast) > (rhs.lastActivityAt ?? .distantPast)
+                }
+
+                return lhs.displayName.localizedCaseInsensitiveCompare(rhs.displayName) == .orderedAscending
+            }
+    }
+
+    private func contactSearchRank(_ contact: ContactListItem, term: String) -> Int {
+        let displayName = contact.displayName.lowercased()
+        let organizationName = contact.subtitle.lowercased()
+        let email = contact.primaryEmail?.lowercased() ?? ""
+        let phone = contact.primaryPhone?.lowercased() ?? ""
+
+        if displayName == term { return 0 }
+        if displayName.hasPrefix(term) { return 1 }
+        if displayName.contains(" \(term)") { return 2 }
+        if organizationName.contains(term) { return 3 }
+        if email.contains(term) { return 4 }
+        if phone.contains(term) { return 5 }
+        return 6
+    }
+
+    private func searchableContactFields(_ contact: ContactListItem) -> [String] {
+        [
+            contact.displayName,
+            contact.subtitle,
+            contact.primaryEmail ?? "",
+            contact.primaryPhone ?? "",
+            contact.city ?? "",
+            contact.country ?? ""
+        ].map { $0.lowercased() }
     }
 }
