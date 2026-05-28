@@ -1,5 +1,6 @@
 import AppKit
 import Contacts
+import ImageIO
 import SwiftUI
 import UniformTypeIdentifiers
 
@@ -40,6 +41,16 @@ struct ContentView: View {
             Button("OK", role: .cancel) { model.errorMessage = nil }
         } message: {
             Text(model.errorMessage ?? "")
+        }
+        .sheet(item: $model.pendingMergeDraft) { draft in
+            MergeReviewView(draft: draft)
+                .environmentObject(model)
+        }
+        .sheet(item: $model.pendingReverseEnrichmentSuggestion) { suggestion in
+            if let bundle = model.selectedBundle {
+                ReverseEnrichmentReviewView(core: bundle.core, suggestion: suggestion)
+                    .environmentObject(model)
+            }
         }
     }
 }
@@ -87,6 +98,8 @@ private struct ContactListView: View {
             } else if model.contacts.isEmpty && model.isLoading {
                 ProgressView("Loading Contacts…")
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else if model.selectedFilter == .duplicates {
+                DuplicateGroupsView()
             } else if model.contacts.isEmpty {
                 ContentUnavailableView(
                     model.selectedFilter == .archived ? "No Archived Contacts" : "No Contacts",
@@ -106,6 +119,427 @@ private struct ContactListView: View {
             }
         }
         .navigationTitle(model.contactListTitle)
+    }
+}
+
+private struct DuplicateGroupsView: View {
+    @EnvironmentObject private var model: OrbitAppModel
+
+    var body: some View {
+        Group {
+            if model.duplicateGroups.isEmpty {
+                ContentUnavailableView(
+                    "No Duplicates",
+                    systemImage: "person.2.slash",
+                    description: Text("Orbit did not find contacts sharing the same primary phone, primary email, or first and last name.")
+                )
+            } else {
+                List(selection: selection) {
+                    ForEach(model.duplicateGroups) { group in
+                        duplicateSection(group)
+                    }
+                }
+                .listStyle(.inset)
+            }
+        }
+    }
+
+    private var selection: Binding<Int64?> {
+        Binding(
+            get: { model.selectedContactID },
+            set: { newValue in
+                Task { @MainActor in model.setSelection(newValue) }
+            }
+        )
+    }
+
+    private func duplicateSection(_ group: ContactDuplicateGroup) -> some View {
+        Section {
+            ForEach(group.contacts) { contact in
+                DuplicateContactRow(
+                    contact: contact,
+                    merge: { model.prepareDuplicateMerge(group, into: contact.id) }
+                )
+                .tag(contact.id)
+            }
+        } header: {
+            Label(group.title, systemImage: group.kind.systemImage)
+        } footer: {
+            Text("\(group.contacts.count) contacts")
+        }
+    }
+}
+
+private struct DuplicateContactRow: View {
+    let contact: ContactListItem
+    let merge: () -> Void
+
+    var body: some View {
+        HStack(spacing: 8) {
+            ContactRow(contact: contact)
+            Spacer(minLength: 8)
+            Button("Merge Others Here", action: merge)
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+        }
+        .padding(.vertical, 2)
+    }
+}
+
+private enum MergeField: String, CaseIterable, Identifiable {
+    case givenName
+    case familyName
+    case organizationName
+    case jobTitle
+    case primaryEmail
+    case primaryPhone
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .givenName: "First"
+        case .familyName: "Last"
+        case .organizationName: "Company"
+        case .jobTitle: "Title"
+        case .primaryEmail: "Primary Email"
+        case .primaryPhone: "Primary Phone"
+        }
+    }
+}
+
+private struct MergeReviewView: View {
+    @EnvironmentObject private var model: OrbitAppModel
+    @Environment(\.dismiss) private var dismiss
+    let draft: ContactMergeDraft
+
+    @State private var selectedCandidateIDs: [MergeField: Int64] = [:]
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Merge Contacts")
+                        .font(.title2.weight(.semibold))
+                    if let target = draft.target {
+                        Text("Destination: \(target.displayName)")
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                Spacer()
+                Button("Cancel") {
+                    model.pendingMergeDraft = nil
+                    dismiss()
+                }
+                Button("Merge", role: .destructive) {
+                    model.mergeDuplicateGroup(draft, resolution: resolution)
+                    dismiss()
+                }
+                .buttonStyle(.borderedProminent)
+            }
+            .padding(20)
+
+            Divider()
+
+            Form {
+                Section("Conflicts") {
+                    ForEach(MergeField.allCases) { field in
+                        MergeFieldChoiceRow(
+                            field: field,
+                            candidates: candidatesWithValues(for: field),
+                            selectedCandidateID: binding(for: field),
+                            value: value
+                        )
+                    }
+                }
+            }
+            .formStyle(.grouped)
+        }
+        .frame(minWidth: 560, minHeight: 520)
+        .onAppear(perform: seedSelections)
+    }
+
+    private var resolution: ContactMergeResolution {
+        ContactMergeResolution(
+            identity: AppleContactIdentityDraft(
+                givenName: selectedValue(for: .givenName) ?? "",
+                familyName: selectedValue(for: .familyName) ?? "",
+                organizationName: selectedValue(for: .organizationName) ?? "",
+                isCompany: selectedValue(for: .organizationName)?.nonEmpty != nil
+            ),
+            jobTitle: selectedValue(for: .jobTitle) ?? "",
+            primaryEmail: selectedValue(for: .primaryEmail),
+            primaryPhone: selectedValue(for: .primaryPhone)
+        )
+    }
+
+    private func seedSelections() {
+        guard selectedCandidateIDs.isEmpty else { return }
+        for field in MergeField.allCases {
+            let candidates = candidatesWithValues(for: field)
+            let targetID = draft.targetID
+            selectedCandidateIDs[field] = candidates.first { $0.id == targetID }?.id ?? candidates.first?.id
+        }
+    }
+
+    private func binding(for field: MergeField) -> Binding<Int64> {
+        Binding(
+            get: {
+                selectedCandidateIDs[field]
+                    ?? candidatesWithValues(for: field).first?.id
+                    ?? draft.targetID
+            },
+            set: { selectedCandidateIDs[field] = $0 }
+        )
+    }
+
+    private func candidatesWithValues(for field: MergeField) -> [ContactMergeCandidate] {
+        draft.candidates.filter { value(for: field, candidate: $0).nonEmpty != nil }
+    }
+
+    private func selectedValue(for field: MergeField) -> String? {
+        let selectedID = selectedCandidateIDs[field] ?? draft.targetID
+        let candidate = draft.candidates.first { $0.id == selectedID }
+            ?? candidatesWithValues(for: field).first
+        return candidate.map { value(for: field, candidate: $0) }?.nonEmpty
+    }
+
+    private func value(for field: MergeField, candidate: ContactMergeCandidate) -> String {
+        switch field {
+        case .givenName: candidate.givenName
+        case .familyName: candidate.familyName
+        case .organizationName: candidate.organizationName
+        case .jobTitle: candidate.jobTitle
+        case .primaryEmail: candidate.primaryEmail ?? ""
+        case .primaryPhone: candidate.primaryPhone ?? ""
+        }
+    }
+}
+
+private struct MergeFieldChoiceRow: View {
+    let field: MergeField
+    let candidates: [ContactMergeCandidate]
+    @Binding var selectedCandidateID: Int64
+    let value: (MergeField, ContactMergeCandidate) -> String
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text(field.title)
+                .font(.headline)
+            if candidates.isEmpty {
+                Text("No value")
+                    .foregroundStyle(.secondary)
+            } else {
+                Picker(field.title, selection: $selectedCandidateID) {
+                    ForEach(candidates) { candidate in
+                        Text("\(value(field, candidate)) - \(candidate.displayName)")
+                            .tag(candidate.id)
+                    }
+                }
+                .labelsHidden()
+            }
+        }
+        .padding(.vertical, 4)
+    }
+}
+
+private struct ReverseEnrichmentReviewView: View {
+    @EnvironmentObject private var model: OrbitAppModel
+    @Environment(\.dismiss) private var dismiss
+    let core: ContactCore
+    let suggestion: ReverseEnrichmentSuggestion
+
+    @State private var selectedFields: Set<MergeField> = []
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Reverse Enrichment")
+                        .font(.title2.weight(.semibold))
+                    Text([suggestion.source, suggestion.confidence].compactMap { $0 }.joined(separator: " - "))
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+                Button("Cancel") {
+                    model.pendingReverseEnrichmentSuggestion = nil
+                    dismiss()
+                }
+                Button("Apply") {
+                    model.applyReverseEnrichment(contactID: core.id, resolution: resolution)
+                    dismiss()
+                }
+                .buttonStyle(.borderedProminent)
+            }
+            .padding(20)
+
+            Divider()
+
+            Form {
+                Section("Suggestions") {
+                    enrichmentRow(field: .givenName, current: core.givenName, suggested: suggestion.identity.givenName)
+                    enrichmentRow(field: .familyName, current: core.familyName, suggested: suggestion.identity.familyName)
+                    enrichmentRow(field: .organizationName, current: core.organizationName, suggested: suggestion.identity.organizationName)
+                    enrichmentRow(field: .jobTitle, current: core.jobTitle, suggested: suggestion.jobTitle)
+                    enrichmentRow(field: .primaryEmail, current: core.primaryEmail ?? "", suggested: suggestion.workEmail ?? "")
+                    enrichmentRow(field: .primaryPhone, current: core.primaryPhone ?? "", suggested: suggestion.phoneNumber ?? "")
+                }
+
+                if suggestion.companyWebsite != nil || suggestion.linkedinURL != nil {
+                    Section("Reference") {
+                        if let companyWebsite = suggestion.companyWebsite {
+                            CopyableContactValue(systemImage: "globe", displayValue: companyWebsite, copyValue: companyWebsite)
+                        }
+                        if let linkedinURL = suggestion.linkedinURL {
+                            CopyableContactValue(systemImage: "link", displayValue: linkedinURL, copyValue: linkedinURL)
+                        }
+                    }
+                }
+
+                Section("Raw Dump") {
+                    TextEditor(text: .constant(suggestion.rawResponseJSON))
+                        .font(.system(.caption, design: .monospaced))
+                        .frame(minHeight: 140)
+                        .disabled(true)
+                    Button("Copy Raw JSON", systemImage: "doc.on.doc") {
+                        NSPasteboard.general.clearContents()
+                        NSPasteboard.general.setString(suggestion.rawResponseJSON, forType: .string)
+                    }
+                }
+            }
+            .formStyle(.grouped)
+        }
+        .frame(minWidth: 600, minHeight: 560)
+        .onAppear(perform: seedSelections)
+    }
+
+    private var resolution: ContactMergeResolution {
+        ContactMergeResolution(
+            identity: AppleContactIdentityDraft(
+                givenName: selectedValue(.givenName, current: core.givenName, suggested: suggestion.identity.givenName),
+                familyName: selectedValue(.familyName, current: core.familyName, suggested: suggestion.identity.familyName),
+                organizationName: selectedValue(.organizationName, current: core.organizationName, suggested: suggestion.identity.organizationName),
+                isCompany: core.isCompany
+            ),
+            jobTitle: selectedValue(.jobTitle, current: core.jobTitle, suggested: suggestion.jobTitle),
+            primaryEmail: selectedValue(.primaryEmail, current: core.primaryEmail ?? "", suggested: suggestion.workEmail ?? "").nonEmpty,
+            primaryPhone: selectedValue(.primaryPhone, current: core.primaryPhone ?? "", suggested: suggestion.phoneNumber ?? "").nonEmpty
+        )
+    }
+
+    private func seedSelections() {
+        guard selectedFields.isEmpty else { return }
+        for field in MergeField.allCases {
+            let suggested = suggestedValue(for: field)
+            let current = currentValue(for: field)
+            if suggested.nonEmpty != nil && suggested != current {
+                selectedFields.insert(field)
+            }
+        }
+    }
+
+    private func enrichmentRow(field: MergeField, current: String, suggested: String) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: 12) {
+            Toggle(field.title, isOn: Binding(
+                get: { selectedFields.contains(field) },
+                set: { isSelected in
+                    if isSelected {
+                        selectedFields.insert(field)
+                    } else {
+                        selectedFields.remove(field)
+                    }
+                }
+            ))
+            .toggleStyle(.checkbox)
+            .frame(width: 150, alignment: .leading)
+
+            VStack(alignment: .leading, spacing: 3) {
+                Text(suggested.nonEmpty ?? "No suggestion")
+                    .font(.body)
+                Text(current.nonEmpty.map { "Current: \($0)" } ?? "Current: empty")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .disabled(suggested.nonEmpty == nil)
+    }
+
+    private func selectedValue(_ field: MergeField, current: String, suggested: String) -> String {
+        selectedFields.contains(field) ? suggested : current
+    }
+
+    private func currentValue(for field: MergeField) -> String {
+        switch field {
+        case .givenName: core.givenName
+        case .familyName: core.familyName
+        case .organizationName: core.organizationName
+        case .jobTitle: core.jobTitle
+        case .primaryEmail: core.primaryEmail ?? ""
+        case .primaryPhone: core.primaryPhone ?? ""
+        }
+    }
+
+    private func suggestedValue(for field: MergeField) -> String {
+        switch field {
+        case .givenName: suggestion.identity.givenName
+        case .familyName: suggestion.identity.familyName
+        case .organizationName: suggestion.identity.organizationName
+        case .jobTitle: suggestion.jobTitle
+        case .primaryEmail: suggestion.workEmail ?? ""
+        case .primaryPhone: suggestion.phoneNumber ?? ""
+        }
+    }
+}
+
+private struct ManualMergePickerView: View {
+    @EnvironmentObject private var model: OrbitAppModel
+    @Environment(\.dismiss) private var dismiss
+    let target: ContactCore
+    @State private var searchText = ""
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Merge Into \(target.displayName)")
+                        .font(.title2.weight(.semibold))
+                    Text("Choose another contact to merge into this one.")
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+                Button("Cancel") {
+                    dismiss()
+                }
+            }
+            .padding(20)
+
+            Divider()
+
+            List(model.mergeCandidateContacts) { contact in
+                HStack(spacing: 8) {
+                    ContactRow(contact: contact)
+                    Spacer(minLength: 8)
+                    Button("Select") {
+                        model.prepareManualMerge(
+                            targetContactID: target.id,
+                            sourceContactID: contact.id
+                        )
+                        dismiss()
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.small)
+                }
+            }
+            .listStyle(.inset)
+            .searchable(text: $searchText, placement: .toolbar, prompt: "Find contact")
+            .onAppear {
+                model.loadManualMergeCandidates(excluding: target.id, search: searchText)
+            }
+            .onChange(of: searchText) { _, _ in
+                model.loadManualMergeCandidates(excluding: target.id, search: searchText)
+            }
+        }
+        .frame(minWidth: 520, minHeight: 560)
     }
 }
 
@@ -141,7 +575,7 @@ private struct ContactRow: View {
                     Label("Archived", systemImage: "archivebox")
                         .font(.caption)
                         .foregroundStyle(.secondary)
-                } else if contact.verificationStatus != .verified && !contact.hasAnyImage {
+                } else if contact.verificationStatus != .verified {
                     Label(contact.verificationStatus.title, systemImage: "checkmark.shield")
                         .font(.caption)
                         .foregroundStyle(.blue)
@@ -193,27 +627,29 @@ private struct ContactDetailView: View {
     let bundle: OrbitContactBundle
 
     @State private var noteBody = ""
-    @State private var appleDisplayName = ""
+    @State private var appleIdentity = AppleContactIdentityDraft()
     @State private var isImportingProfileImage = false
     @State private var selectedTab: ContactTab = .derived
     @State private var editingInsightID: Int64?
     @State private var insightDraft = ""
     @State private var insightKind: InsightKind = .general
-    @State private var isConfirmingArchive = false
+    @State private var isPickingMergeSource = false
 
     var body: some View {
         VStack(spacing: 0) {
             ContactIdentityHeader(
-                appleDisplayName: $appleDisplayName,
+                appleIdentity: $appleIdentity,
                 core: bundle.core,
                 beginImageImport: { isImportingProfileImage = true },
                 openWhatsApp: { model.openWhatsAppChat(contactID: bundle.id) },
                 confirmVerification: {
-                    model.confirmVerification(contactID: bundle.id, appleDisplayName: appleDisplayName)
+                    model.confirmVerification(contactID: bundle.id, appleIdentity: appleIdentity)
                 },
                 unverify: { model.unverifyContact(contactID: bundle.id) },
-                archive: { isConfirmingArchive = true },
-                restore: { model.restoreContact(contactID: bundle.id) }
+                archive: { model.archiveContact(contactID: bundle.id) },
+                restore: { model.restoreContact(contactID: bundle.id) },
+                beginMerge: { isPickingMergeSource = true },
+                reverseEnrich: { model.reverseEnrich(contactID: bundle.id) }
             )
             .padding(.horizontal, 20)
             .padding(.top, 20)
@@ -270,16 +706,9 @@ private struct ContactDetailView: View {
         .onChange(of: bundle.core.verifiedAt) { _, _ in
             hydrateVerificationFields()
         }
-        .confirmationDialog(
-            "Archive Contact",
-            isPresented: $isConfirmingArchive
-        ) {
-            Button("Archive Contact", role: .destructive) {
-                model.archiveContact(contactID: bundle.id)
-            }
-            Button("Cancel", role: .cancel) {}
-        } message: {
-            Text("This hides the contact from normal lists but keeps Orbit notes, insights, and follow-ups available in Archived.")
+        .sheet(isPresented: $isPickingMergeSource) {
+            ManualMergePickerView(target: bundle.core)
+                .environmentObject(model)
         }
     }
 
@@ -322,6 +751,7 @@ private struct ContactDetailView: View {
 
     private func resetEditors() {
         noteBody = ""
+        isPickingMergeSource = false
         resetInsightEditor()
     }
 
@@ -332,7 +762,7 @@ private struct ContactDetailView: View {
     }
 
     private func hydrateVerificationFields() {
-        appleDisplayName = bundle.core.displayName
+        appleIdentity = AppleContactIdentityDraft(core: bundle.core)
     }
 
     private func handleImportedProfileImage(_ result: Result<[URL], Error>) {
@@ -345,7 +775,8 @@ private struct ContactDetailView: View {
                 }
             }
             let imageData = try Data(contentsOf: url, options: [.mappedIfSafe])
-            model.importVerificationImage(contactID: bundle.id, imageData: imageData, source: "manual_upload")
+            let storedImageData = ProfileImageProcessor.downsampledPNGData(from: imageData) ?? imageData
+            model.importVerificationImage(contactID: bundle.id, imageData: storedImageData, source: "manual_upload")
         } catch {
             model.errorMessage = error.localizedDescription
         }
@@ -534,7 +965,7 @@ private struct RawNotesView: View {
 }
 
 private struct ContactIdentityHeader: View {
-    @Binding var appleDisplayName: String
+    @Binding var appleIdentity: AppleContactIdentityDraft
     let core: ContactCore
     let beginImageImport: () -> Void
     let openWhatsApp: () -> Void
@@ -542,6 +973,8 @@ private struct ContactIdentityHeader: View {
     let unverify: () -> Void
     let archive: () -> Void
     let restore: () -> Void
+    let beginMerge: () -> Void
+    let reverseEnrich: () -> Void
 
     var body: some View {
         HStack(alignment: .top, spacing: 18) {
@@ -549,9 +982,10 @@ private struct ContactIdentityHeader: View {
 
             VStack(alignment: .leading, spacing: 8) {
                 HStack(alignment: .firstTextBaseline, spacing: 10) {
-                    TextField("Contact name", text: $appleDisplayName)
+                    Text(appleIdentity.displayName)
                         .font(.largeTitle)
-                        .textFieldStyle(.plain)
+                        .fontWeight(.semibold)
+                        .lineLimit(2)
 
                     VerificationStatusBadge(status: core.verificationStatus)
 
@@ -574,6 +1008,19 @@ private struct ContactIdentityHeader: View {
                         .foregroundStyle(.secondary)
                 }
 
+                VStack(alignment: .leading, spacing: 6) {
+                    Toggle("Company", isOn: $appleIdentity.isCompany)
+                        .toggleStyle(.checkbox)
+
+                    HStack(spacing: 10) {
+                        TextField("First", text: $appleIdentity.givenName)
+                        TextField("Last", text: $appleIdentity.familyName)
+                        TextField("Company", text: $appleIdentity.organizationName)
+                    }
+                    .textFieldStyle(.roundedBorder)
+                }
+                .frame(maxWidth: 560, alignment: .leading)
+
                 VStack(alignment: .leading, spacing: 8) {
                     if let email = core.primaryEmail {
                         CopyableContactValue(systemImage: "envelope", displayValue: email, copyValue: email)
@@ -591,15 +1038,20 @@ private struct ContactIdentityHeader: View {
                 HStack(spacing: 10) {
                     Button(action: openWhatsApp) { WhatsAppIcon() }
                         .buttonStyle(.plain)
+                        .keyboardShortcut("w", modifiers: [.command, .control])
                         .help("Open this contact in WhatsApp")
                     if core.verificationStatus == .verified {
                         Button("Mark Unverified", action: unverify)
                             .buttonStyle(.bordered)
                             .controlSize(.small)
+                            .keyboardShortcut("v", modifiers: [.command, .control])
+                            .help("Mark unverified")
                     } else {
                         Button("Mark Verified", action: confirmVerification)
                             .buttonStyle(.borderedProminent)
                             .controlSize(.small)
+                            .keyboardShortcut("v", modifiers: [.command, .control])
+                            .help("Mark verified")
                     }
                     if let source = core.enrichedImageSource?.nonEmpty {
                         Label(source.replacingOccurrences(of: "_", with: " ").capitalized, systemImage: "photo.badge.checkmark")
@@ -607,14 +1059,26 @@ private struct ContactIdentityHeader: View {
                             .foregroundStyle(.secondary)
                     }
                     Spacer()
+                    Button("Reverse Enrich", systemImage: "wand.and.sparkles", action: reverseEnrich)
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+                        .help("Suggest identity fields from email or phone")
+                    Button("Merge", systemImage: "arrow.triangle.merge", action: beginMerge)
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+                        .help("Merge another contact into this contact")
                     if core.isArchived {
                         Button("Restore", systemImage: "arrow.uturn.backward", action: restore)
                             .buttonStyle(.bordered)
                             .controlSize(.small)
+                            .keyboardShortcut("a", modifiers: [.command, .control])
+                            .help("Restore contact")
                     } else {
                         Button("Archive", systemImage: "archivebox", action: archive)
                             .buttonStyle(.bordered)
                             .controlSize(.small)
+                            .keyboardShortcut("a", modifiers: [.command, .control])
+                            .help("Archive contact")
                     }
                 }
 
@@ -648,7 +1112,7 @@ private struct ContactAvatar: View {
             ZStack {
                 Circle().fill(.regularMaterial)
 
-                if let data = core.resolvedImageData, let image = NSImage(data: data) {
+                if let data = core.resolvedImageData, let image = ContactImageCache.shared.image(for: data) {
                     Image(nsImage: image)
                         .resizable()
                         .scaledToFill()
@@ -677,6 +1141,49 @@ private struct ContactAvatar: View {
         .buttonStyle(.plain)
         .help("Upload profile image")
         .onHover { isHovered = $0 }
+    }
+}
+
+private final class ContactImageCache {
+    static let shared = ContactImageCache()
+
+    private let cache = NSCache<NSData, NSImage>()
+
+    private init() {
+        cache.countLimit = 256
+        cache.totalCostLimit = 32 * 1024 * 1024
+    }
+
+    func image(for data: Data) -> NSImage? {
+        let key = data as NSData
+        if let cached = cache.object(forKey: key) {
+            return cached
+        }
+        guard let image = NSImage(data: data) else { return nil }
+        cache.setObject(image, forKey: key, cost: data.count)
+        return image
+    }
+}
+
+private enum ProfileImageProcessor {
+    static func downsampledPNGData(from data: Data, maxPixelSize: CGFloat = 512) -> Data? {
+        let options = [kCGImageSourceShouldCache: false] as CFDictionary
+        guard let source = CGImageSourceCreateWithData(data as CFData, options) else {
+            return nil
+        }
+
+        let thumbnailOptions = [
+            kCGImageSourceCreateThumbnailFromImageAlways: true,
+            kCGImageSourceShouldCacheImmediately: true,
+            kCGImageSourceCreateThumbnailWithTransform: true,
+            kCGImageSourceThumbnailMaxPixelSize: Int(maxPixelSize)
+        ] as CFDictionary
+        guard let image = CGImageSourceCreateThumbnailAtIndex(source, 0, thumbnailOptions) else {
+            return nil
+        }
+
+        let bitmap = NSBitmapImageRep(cgImage: image)
+        return bitmap.representation(using: .png, properties: [:])
     }
 }
 

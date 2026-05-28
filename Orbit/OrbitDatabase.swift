@@ -23,6 +23,11 @@ final class OrbitDatabase: @unchecked Sendable {
     private let db: OpaquePointer
     private let queue = DispatchQueue(label: "io.zvh.orbit.database")
 
+    private enum ContactListActivitySQL {
+        case derived
+        case zero
+    }
+
     init() throws {
         let appSupport = try FileManager.default.url(
             for: .applicationSupportDirectory,
@@ -59,9 +64,12 @@ final class OrbitDatabase: @unchecked Sendable {
         try queue.sync {
             try execute("BEGIN IMMEDIATE TRANSACTION;")
             do {
+                let statement = try prepare(Self.contactUpsertSQL)
+                defer { sqlite3_finalize(statement) }
                 for snapshot in snapshots {
-                    try upsert(snapshot: snapshot)
+                    try upsert(snapshot: snapshot, statement: statement)
                 }
+                try rebuildContactDerivedFields()
                 try execute("COMMIT;")
             } catch {
                 try? execute("ROLLBACK;")
@@ -72,11 +80,10 @@ final class OrbitDatabase: @unchecked Sendable {
 
     nonisolated func fetchContacts(filter: SidebarFilter, search: String) throws -> [ContactListItem] {
         try queue.sync {
-            let searchTerm = search.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty
+            let searchTerm = search.trimmingCharacters(in: .whitespacesAndNewlines).lowercased().nonEmpty
             let likeValue = searchTerm.map { "%\($0)%" }
             let prefixLikeValue = searchTerm.map { "\($0)%" }
             let wordPrefixLikeValue = searchTerm.map { "% \($0)%" }
-            let shouldSearchBodies = searchTerm.map { $0.count >= 3 } ?? false
             let filterClause: String
             switch filter {
             case .allContacts:
@@ -89,33 +96,14 @@ final class OrbitDatabase: @unchecked Sendable {
                 AND c.image_data IS NULL
                 AND c.enriched_image_data IS NULL
                 """
+            case .duplicates:
+                filterClause = ""
             case .needsFollowUp:
-                filterClause = """
-                AND EXISTS (
-                    SELECT 1 FROM follow_ups f
-                    WHERE f.contact_id = c.id AND f.completed_at IS NULL
-                )
-                """
+                filterClause = "AND c.open_follow_up_count > 0"
             case .recentActivity:
                 filterClause = """
                 AND c.is_archived = 0
-                AND (
-                    EXISTS (
-                        SELECT 1 FROM notes n
-                        WHERE n.contact_id = c.id
-                          AND n.created_at >= strftime('%s','now') - 2592000
-                    )
-                    OR EXISTS (
-                        SELECT 1 FROM insights i
-                        WHERE i.contact_id = c.id
-                          AND i.updated_at >= strftime('%s','now') - 2592000
-                    )
-                    OR EXISTS (
-                        SELECT 1 FROM follow_ups f
-                        WHERE f.contact_id = c.id
-                          AND f.created_at >= strftime('%s','now') - 2592000
-                    )
-                )
+                AND c.last_activity_at >= strftime('%s','now') - 2592000
                 """
             case .archived:
                 filterClause = "AND c.is_archived = 1"
@@ -131,44 +119,15 @@ final class OrbitDatabase: @unchecked Sendable {
 
             if searchTerm == nil && filter != .recentActivity {
                 let sql = """
-                WITH follow_up_activity AS (
-                    SELECT
-                        contact_id,
-                        MAX(created_at) AS last_follow_up_at,
-                        MIN(CASE WHEN completed_at IS NULL THEN due_at END) AS next_follow_up_at,
-                        SUM(CASE WHEN completed_at IS NULL THEN 1 ELSE 0 END) AS open_follow_up_count
-                    FROM follow_ups
-                    GROUP BY contact_id
-                )
                 SELECT
-                    c.id,
-                    c.apple_identifier,
-                    c.display_name,
-                    COALESCE(NULLIF(TRIM(c.job_title || CASE
-                        WHEN c.job_title != '' AND c.organization_name != '' THEN ' at '
-                        ELSE ''
-                    END || c.organization_name), ''), '') AS subtitle,
-                    c.primary_email,
-                    c.primary_phone,
-                    c.city,
-                    c.country,
-                    COALESCE(fua.last_follow_up_at, 0) AS last_activity_at,
-                    fua.next_follow_up_at,
-                    COALESCE(fua.open_follow_up_count, 0) AS open_follow_up_count,
-                    c.verification_status,
-                    CASE
-                        WHEN c.enriched_image_data IS NOT NULL OR c.image_data IS NOT NULL THEN 1
-                        ELSE 0
-                    END AS has_any_image,
-                    c.is_archived
+                    \(Self.contactListColumns(activity: .derived))
                 FROM contacts c
-                LEFT JOIN follow_up_activity fua ON fua.contact_id = c.id
                 WHERE 1 = 1
                 \(archiveClause)
                 \(filterClause)
                 ORDER BY
-                    CASE WHEN next_follow_up_at IS NULL THEN 1 ELSE 0 END,
-                    next_follow_up_at ASC,
+                    CASE WHEN c.next_follow_up_at IS NULL THEN 1 ELSE 0 END,
+                    c.next_follow_up_at ASC,
                     c.display_name COLLATE NOCASE ASC;
                 """
 
@@ -180,86 +139,14 @@ final class OrbitDatabase: @unchecked Sendable {
             let searchClause: String
             if searchTerm == nil {
                 searchClause = "1 = 1"
-            } else if shouldSearchBodies {
-                searchClause = """
-                (
-                    c.display_name LIKE ? COLLATE NOCASE
-                    OR c.organization_name LIKE ? COLLATE NOCASE
-                    OR c.job_title LIKE ? COLLATE NOCASE
-                    OR c.primary_email LIKE ? COLLATE NOCASE
-                    OR EXISTS (
-                        SELECT 1 FROM notes n
-                        WHERE n.contact_id = c.id
-                          AND n.body LIKE ? COLLATE NOCASE
-                    )
-                    OR EXISTS (
-                        SELECT 1 FROM insights i
-                        WHERE i.contact_id = c.id
-                          AND i.body LIKE ? COLLATE NOCASE
-                    )
-                )
-                """
             } else {
-                searchClause = """
-                (
-                    c.display_name LIKE ? COLLATE NOCASE
-                    OR c.organization_name LIKE ? COLLATE NOCASE
-                    OR c.job_title LIKE ? COLLATE NOCASE
-                    OR c.primary_email LIKE ? COLLATE NOCASE
-                )
-                """
+                searchClause = "c.search_text LIKE ?"
             }
 
             let sql = """
-            WITH
-                note_activity AS (
-                    SELECT contact_id, MAX(created_at) AS last_note_at
-                    FROM notes
-                    GROUP BY contact_id
-                ),
-                insight_activity AS (
-                    SELECT contact_id, MAX(updated_at) AS last_insight_at
-                    FROM insights
-                    GROUP BY contact_id
-                ),
-                follow_up_activity AS (
-                    SELECT
-                        contact_id,
-                        MAX(created_at) AS last_follow_up_at,
-                        MIN(CASE WHEN completed_at IS NULL THEN due_at END) AS next_follow_up_at,
-                        SUM(CASE WHEN completed_at IS NULL THEN 1 ELSE 0 END) AS open_follow_up_count
-                    FROM follow_ups
-                    GROUP BY contact_id
-                )
             SELECT
-                c.id,
-                c.apple_identifier,
-                c.display_name,
-                COALESCE(NULLIF(TRIM(c.job_title || CASE
-                    WHEN c.job_title != '' AND c.organization_name != '' THEN ' at '
-                    ELSE ''
-                END || c.organization_name), ''), '') AS subtitle,
-                c.primary_email,
-                c.primary_phone,
-                c.city,
-                c.country,
-                MAX(
-                    COALESCE(na.last_note_at, 0),
-                    COALESCE(ia.last_insight_at, 0),
-                    COALESCE(fua.last_follow_up_at, 0)
-                ) AS last_activity_at,
-                fua.next_follow_up_at,
-                COALESCE(fua.open_follow_up_count, 0) AS open_follow_up_count,
-                c.verification_status,
-                CASE
-                    WHEN c.enriched_image_data IS NOT NULL OR c.image_data IS NOT NULL THEN 1
-                    ELSE 0
-                END AS has_any_image,
-                c.is_archived
+                \(Self.contactListColumns(activity: .derived))
             FROM contacts c
-            LEFT JOIN note_activity na ON na.contact_id = c.id
-            LEFT JOIN insight_activity ia ON ia.contact_id = c.id
-            LEFT JOIN follow_up_activity fua ON fua.contact_id = c.id
             WHERE \(searchClause)
             \(archiveClause)
             \(filterClause)
@@ -274,26 +161,23 @@ final class OrbitDatabase: @unchecked Sendable {
                     WHEN c.primary_email LIKE ? COLLATE NOCASE THEN 5
                     ELSE 6
                 END,
-                CASE WHEN next_follow_up_at IS NULL THEN 1 ELSE 0 END,
-                next_follow_up_at ASC,
-                last_activity_at DESC,
+                CASE WHEN c.next_follow_up_at IS NULL THEN 1 ELSE 0 END,
+                c.next_follow_up_at ASC,
+                c.last_activity_at DESC,
                 c.display_name COLLATE NOCASE ASC;
             """
 
             let statement = try prepare(sql)
             defer { sqlite3_finalize(statement) }
             if let likeValue {
-                let bindCount = shouldSearchBodies ? 6 : 4
-                for index in 1...bindCount {
-                    try bindText(likeValue, to: Int32(index), in: statement)
-                }
-                try bindText(searchTerm, to: Int32(bindCount + 1), in: statement)
-                try bindText(searchTerm, to: Int32(bindCount + 2), in: statement)
-                try bindText(prefixLikeValue, to: Int32(bindCount + 3), in: statement)
-                try bindText(wordPrefixLikeValue, to: Int32(bindCount + 4), in: statement)
-                try bindText(likeValue, to: Int32(bindCount + 5), in: statement)
-                try bindText(likeValue, to: Int32(bindCount + 6), in: statement)
-                try bindText(likeValue, to: Int32(bindCount + 7), in: statement)
+                try bindText(likeValue, to: 1, in: statement)
+                try bindText(searchTerm, to: 2, in: statement)
+                try bindText(searchTerm, to: 3, in: statement)
+                try bindText(prefixLikeValue, to: 4, in: statement)
+                try bindText(wordPrefixLikeValue, to: 5, in: statement)
+                try bindText(likeValue, to: 6, in: statement)
+                try bindText(likeValue, to: 7, in: statement)
+                try bindText(likeValue, to: 8, in: statement)
             } else {
                 for index in 1...7 {
                     try bindText(nil, to: Int32(index), in: statement)
@@ -306,32 +190,207 @@ final class OrbitDatabase: @unchecked Sendable {
         }
     }
 
+    nonisolated func fetchDuplicateGroups(search: String) throws -> [ContactDuplicateGroup] {
+        try queue.sync {
+            let searchTerm = search.trimmingCharacters(in: .whitespacesAndNewlines).lowercased().nonEmpty
+            var grouped: [String: (kind: DuplicateMatchKind, value: String, contacts: [ContactListItem])] = [:]
+
+            try appendDuplicateGroups(
+                kind: .phone,
+                keyColumn: "phone_key",
+                displayExpression: "COALESCE(primary_phone, '')",
+                minimumKeyLength: 6,
+                searchTerm: searchTerm,
+                grouped: &grouped
+            )
+            try appendDuplicateGroups(
+                kind: .email,
+                keyColumn: "email_key",
+                displayExpression: "LOWER(TRIM(COALESCE(primary_email, '')))",
+                minimumKeyLength: 3,
+                searchTerm: searchTerm,
+                grouped: &grouped
+            )
+            try appendDuplicateGroups(
+                kind: .name,
+                keyColumn: "name_key",
+                displayExpression: "TRIM(COALESCE(NULLIF(TRIM(given_name || ' ' || family_name), ''), display_name, ''))",
+                minimumKeyLength: 3,
+                searchTerm: searchTerm,
+                grouped: &grouped
+            )
+
+            return grouped.values
+                .map { ContactDuplicateGroup(kind: $0.kind, value: $0.value, contacts: $0.contacts) }
+                .sorted { lhs, rhs in
+                    if lhs.kind.rawValue != rhs.kind.rawValue {
+                        return lhs.kind.rawValue < rhs.kind.rawValue
+                    }
+                    return lhs.value.localizedCaseInsensitiveCompare(rhs.value) == .orderedAscending
+                }
+        }
+    }
+
+    nonisolated func fetchMergeCandidates(contactIDs: [Int64]) throws -> [ContactMergeCandidate] {
+        guard !contactIDs.isEmpty else { return [] }
+        return try queue.sync {
+            let placeholders = Array(repeating: "?", count: contactIDs.count).joined(separator: ",")
+            let statement = try prepare("""
+            SELECT id, apple_identifier, display_name, given_name, family_name,
+                   organization_name, is_company, job_title, primary_email, primary_phone
+            FROM contacts
+            WHERE id IN (\(placeholders))
+            ORDER BY display_name COLLATE NOCASE ASC;
+            """)
+            defer { sqlite3_finalize(statement) }
+            for (index, contactID) in contactIDs.enumerated() {
+                try bindInt64(contactID, to: Int32(index + 1), in: statement)
+            }
+
+            var candidates: [ContactMergeCandidate] = []
+            while sqlite3_step(statement) == SQLITE_ROW {
+                candidates.append(
+                    ContactMergeCandidate(
+                        id: sqlite3_column_int64(statement, 0),
+                        appleIdentifier: string(at: 1, in: statement),
+                        displayName: string(at: 2, in: statement),
+                        givenName: string(at: 3, in: statement),
+                        familyName: string(at: 4, in: statement),
+                        organizationName: string(at: 5, in: statement),
+                        isCompany: sqlite3_column_int64(statement, 6) != 0,
+                        jobTitle: string(at: 7, in: statement),
+                        primaryEmail: optionalString(at: 8, in: statement),
+                        primaryPhone: optionalString(at: 9, in: statement)
+                    )
+                )
+            }
+            return candidates
+        }
+    }
+
+    private func appendDuplicateGroups(
+        kind: DuplicateMatchKind,
+        keyColumn: String,
+        displayExpression: String,
+        minimumKeyLength: Int,
+        searchTerm: String?,
+        grouped: inout [String: (kind: DuplicateMatchKind, value: String, contacts: [ContactListItem])]
+    ) throws {
+        let sql = """
+        WITH duplicate_keys AS (
+            SELECT \(keyColumn) AS duplicate_key
+            FROM contacts
+            WHERE is_archived = 0
+              AND LENGTH(\(keyColumn)) >= ?
+            GROUP BY duplicate_key
+            HAVING COUNT(*) > 1
+        )
+        SELECT
+            c.\(keyColumn) AS duplicate_key,
+            \(displayExpression) AS duplicate_value,
+            \(Self.contactListColumns(activity: .zero))
+        FROM contacts c
+        JOIN duplicate_keys dk ON dk.duplicate_key = c.\(keyColumn)
+        WHERE c.is_archived = 0
+        ORDER BY duplicate_key COLLATE NOCASE ASC, c.display_name COLLATE NOCASE ASC;
+        """
+        let statement = try prepare(sql)
+        defer { sqlite3_finalize(statement) }
+        sqlite3_bind_int(statement, 1, Int32(minimumKeyLength))
+
+        while sqlite3_step(statement) == SQLITE_ROW {
+            let key = string(at: 0, in: statement)
+            let value = string(at: 1, in: statement).nonEmpty ?? key
+            let item = contactListItem(from: statement, offset: 2)
+            if let searchTerm, !searchableDuplicateFields(item, value: value).contains(where: { $0.contains(searchTerm) }) {
+                continue
+            }
+            let groupKey = "\(kind.rawValue):\(key)"
+            var group = grouped[groupKey] ?? (kind: kind, value: value, contacts: [])
+            if !group.contacts.contains(where: { $0.id == item.id }) {
+                group.contacts.append(item)
+            }
+            grouped[groupKey] = group
+        }
+    }
+
+    private func searchableDuplicateFields(_ item: ContactListItem, value: String) -> [String] {
+        [
+            value,
+            item.displayName,
+            item.subtitle,
+            item.primaryEmail ?? "",
+            item.primaryPhone ?? ""
+        ].map { $0.lowercased() }
+    }
+
+    private static func contactListColumns(activity: ContactListActivitySQL) -> String {
+        let activityColumns: String
+        switch activity {
+        case .derived:
+            activityColumns = """
+            c.last_activity_at,
+            c.next_follow_up_at,
+            c.open_follow_up_count
+            """
+        case .zero:
+            activityColumns = """
+            0 AS last_activity_at,
+            NULL AS next_follow_up_at,
+            0 AS open_follow_up_count
+            """
+        }
+
+        return """
+        c.id,
+        c.apple_identifier,
+        c.display_name,
+        COALESCE(NULLIF(TRIM(c.job_title || CASE
+            WHEN c.job_title != '' AND c.organization_name != '' THEN ' at '
+            ELSE ''
+        END || c.organization_name), ''), '') AS subtitle,
+        c.primary_email,
+        c.primary_phone,
+        c.city,
+        c.country,
+        \(activityColumns),
+        c.verification_status,
+        CASE
+            WHEN c.enriched_image_data IS NOT NULL OR c.image_data IS NOT NULL THEN 1
+            ELSE 0
+        END AS has_any_image,
+        c.is_archived
+        """
+    }
+
     private func contactListItems(from statement: OpaquePointer?) -> [ContactListItem] {
         var items: [ContactListItem] = []
         while sqlite3_step(statement) == SQLITE_ROW {
-            let lastActivityAt = optionalDate(at: 8, in: statement).flatMap {
-                $0.timeIntervalSince1970 > 0 ? $0 : nil
-            }
-            items.append(
-                ContactListItem(
-                    id: sqlite3_column_int64(statement, 0),
-                    appleIdentifier: string(at: 1, in: statement),
-                    displayName: string(at: 2, in: statement),
-                    subtitle: string(at: 3, in: statement),
-                    primaryEmail: optionalString(at: 4, in: statement),
-                    primaryPhone: optionalString(at: 5, in: statement),
-                    city: optionalString(at: 6, in: statement),
-                    country: optionalString(at: 7, in: statement),
-                    lastActivityAt: lastActivityAt,
-                    nextFollowUpAt: optionalDate(at: 9, in: statement),
-                    openFollowUpCount: Int(sqlite3_column_int64(statement, 10)),
-                    verificationStatus: ContactVerificationStatus(rawValue: string(at: 11, in: statement)) ?? .unverified,
-                    hasAnyImage: sqlite3_column_int64(statement, 12) != 0,
-                    isArchived: sqlite3_column_int64(statement, 13) != 0
-                )
-            )
+            items.append(contactListItem(from: statement, offset: 0))
         }
         return items
+    }
+
+    private func contactListItem(from statement: OpaquePointer?, offset: Int32) -> ContactListItem {
+        let lastActivityAt = optionalDate(at: offset + 8, in: statement).flatMap {
+            $0.timeIntervalSince1970 > 0 ? $0 : nil
+        }
+        return ContactListItem(
+            id: sqlite3_column_int64(statement, offset + 0),
+            appleIdentifier: string(at: offset + 1, in: statement),
+            displayName: string(at: offset + 2, in: statement),
+            subtitle: string(at: offset + 3, in: statement),
+            primaryEmail: optionalString(at: offset + 4, in: statement),
+            primaryPhone: optionalString(at: offset + 5, in: statement),
+            city: optionalString(at: offset + 6, in: statement),
+            country: optionalString(at: offset + 7, in: statement),
+            lastActivityAt: lastActivityAt,
+            nextFollowUpAt: optionalDate(at: offset + 9, in: statement),
+            openFollowUpCount: Int(sqlite3_column_int64(statement, offset + 10)),
+            verificationStatus: ContactVerificationStatus(rawValue: string(at: offset + 11, in: statement)) ?? .unverified,
+            hasAnyImage: sqlite3_column_int64(statement, offset + 12) != 0,
+            isArchived: sqlite3_column_int64(statement, offset + 13) != 0
+        )
     }
 
     nonisolated func fetchContactBundle(contactID: Int64) throws -> OrbitContactBundle? {
@@ -363,6 +422,7 @@ final class OrbitDatabase: @unchecked Sendable {
             try bindText(source.rawValue, to: 3, in: statement)
             sqlite3_bind_double(statement, 4, Date().timeIntervalSince1970)
             try stepDone(statement)
+            try refreshContactDerivedFields(contactID: contactID)
         }
     }
 
@@ -389,6 +449,7 @@ final class OrbitDatabase: @unchecked Sendable {
                 try bindInt64(insightID, to: 5, in: statement)
                 try bindInt64(contactID, to: 6, in: statement)
                 try stepDone(statement)
+                try refreshContactDerivedFields(contactID: contactID)
             } else {
                 let sql = """
                 INSERT INTO insights (contact_id, body, kind, source, created_at, updated_at)
@@ -404,16 +465,21 @@ final class OrbitDatabase: @unchecked Sendable {
                 sqlite3_bind_double(statement, 5, now)
                 sqlite3_bind_double(statement, 6, now)
                 try stepDone(statement)
+                try refreshContactDerivedFields(contactID: contactID)
             }
         }
     }
 
     nonisolated func deleteInsight(id: Int64) throws {
         try queue.sync {
+            let contactID = try contactID(forRowID: id, in: "insights")
             let statement = try prepare("DELETE FROM insights WHERE id = ?;")
             defer { sqlite3_finalize(statement) }
             try bindInt64(id, to: 1, in: statement)
             try stepDone(statement)
+            if let contactID {
+                try refreshContactDerivedFields(contactID: contactID)
+            }
         }
     }
 
@@ -445,6 +511,7 @@ final class OrbitDatabase: @unchecked Sendable {
                 try bindInt64(followUpID, to: 5, in: statement)
                 try bindInt64(contactID, to: 6, in: statement)
                 try stepDone(statement)
+                try refreshContactDerivedFields(contactID: contactID)
             } else {
                 let sql = """
                 INSERT INTO follow_ups (contact_id, title, note, due_at, source, created_at)
@@ -463,17 +530,22 @@ final class OrbitDatabase: @unchecked Sendable {
                 try bindText(source.rawValue, to: 5, in: statement)
                 sqlite3_bind_double(statement, 6, Date().timeIntervalSince1970)
                 try stepDone(statement)
+                try refreshContactDerivedFields(contactID: contactID)
             }
         }
     }
 
     nonisolated func completeFollowUp(id: Int64) throws {
         try queue.sync {
+            let contactID = try contactID(forRowID: id, in: "follow_ups")
             let statement = try prepare("UPDATE follow_ups SET completed_at = ? WHERE id = ?;")
             defer { sqlite3_finalize(statement) }
             sqlite3_bind_double(statement, 1, Date().timeIntervalSince1970)
             try bindInt64(id, to: 2, in: statement)
             try stepDone(statement)
+            if let contactID {
+                try refreshContactDerivedFields(contactID: contactID)
+            }
         }
     }
 
@@ -573,7 +645,7 @@ final class OrbitDatabase: @unchecked Sendable {
     private func fetchContactCore(contactID: Int64) throws -> ContactCore? {
         let sql = """
         SELECT id, apple_identifier, given_name, family_name, display_name, organization_name,
-               job_title, primary_email, primary_phone, city, country, birthday_year,
+               is_company, job_title, primary_email, primary_phone, city, country, birthday_year,
                birthday_month, birthday_day, image_data, enriched_image_data,
                enriched_image_source, verified_display_name, verified_phone_e164,
                verification_status, verification_note, verified_at, last_synced_at,
@@ -586,9 +658,9 @@ final class OrbitDatabase: @unchecked Sendable {
         try bindInt64(contactID, to: 1, in: statement)
         guard sqlite3_step(statement) == SQLITE_ROW else { return nil }
 
-        let year = optionalInt(at: 11, in: statement)
-        let month = optionalInt(at: 12, in: statement)
-        let day = optionalInt(at: 13, in: statement)
+        let year = optionalInt(at: 12, in: statement)
+        let month = optionalInt(at: 13, in: statement)
+        let day = optionalInt(at: 14, in: statement)
         let birthday: DateComponents? =
             year == nil && month == nil && day == nil ? nil :
             DateComponents(year: year, month: month, day: day)
@@ -600,23 +672,24 @@ final class OrbitDatabase: @unchecked Sendable {
             familyName: string(at: 3, in: statement),
             displayName: string(at: 4, in: statement),
             organizationName: string(at: 5, in: statement),
-            jobTitle: string(at: 6, in: statement),
-            primaryEmail: optionalString(at: 7, in: statement),
-            primaryPhone: optionalString(at: 8, in: statement),
-            city: optionalString(at: 9, in: statement),
-            country: optionalString(at: 10, in: statement),
+            isCompany: sqlite3_column_int64(statement, 6) != 0,
+            jobTitle: string(at: 7, in: statement),
+            primaryEmail: optionalString(at: 8, in: statement),
+            primaryPhone: optionalString(at: 9, in: statement),
+            city: optionalString(at: 10, in: statement),
+            country: optionalString(at: 11, in: statement),
             birthday: birthday,
-            contactImageData: optionalData(at: 14, in: statement),
-            enrichedImageData: optionalData(at: 15, in: statement),
-            enrichedImageSource: optionalString(at: 16, in: statement),
-            verifiedDisplayName: optionalString(at: 17, in: statement),
-            verifiedPhoneE164: optionalString(at: 18, in: statement),
-            verificationStatus: ContactVerificationStatus(rawValue: string(at: 19, in: statement)) ?? .unverified,
-            verificationNote: optionalString(at: 20, in: statement) ?? "",
-            verifiedAt: optionalDate(at: 21, in: statement),
-            lastSyncedAt: optionalDate(at: 22, in: statement) ?? .now,
-            isArchived: sqlite3_column_int64(statement, 23) != 0,
-            archivedAt: optionalDate(at: 24, in: statement)
+            contactImageData: optionalData(at: 15, in: statement),
+            enrichedImageData: optionalData(at: 16, in: statement),
+            enrichedImageSource: optionalString(at: 17, in: statement),
+            verifiedDisplayName: optionalString(at: 18, in: statement),
+            verifiedPhoneE164: optionalString(at: 19, in: statement),
+            verificationStatus: ContactVerificationStatus(rawValue: string(at: 20, in: statement)) ?? .unverified,
+            verificationNote: optionalString(at: 21, in: statement) ?? "",
+            verifiedAt: optionalDate(at: 22, in: statement),
+            lastSyncedAt: optionalDate(at: 23, in: statement) ?? .now,
+            isArchived: sqlite3_column_int64(statement, 24) != 0,
+            archivedAt: optionalDate(at: 25, in: statement)
         )
     }
 
@@ -703,19 +776,19 @@ final class OrbitDatabase: @unchecked Sendable {
         return items
     }
 
-    private func upsert(snapshot: ContactSyncSnapshot) throws {
-        let statement = try prepare("""
+    private static let contactUpsertSQL = """
         INSERT INTO contacts (
             apple_identifier, given_name, family_name, display_name,
-            organization_name, job_title, primary_email, primary_phone,
+            organization_name, is_company, job_title, primary_email, primary_phone,
             city, country, birthday_year, birthday_month, birthday_day,
             image_data, last_synced_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(apple_identifier) DO UPDATE SET
             given_name = excluded.given_name,
             family_name = excluded.family_name,
             display_name = excluded.display_name,
             organization_name = excluded.organization_name,
+            is_company = excluded.is_company,
             job_title = excluded.job_title,
             primary_email = excluded.primary_email,
             primary_phone = excluded.primary_phone,
@@ -725,30 +798,72 @@ final class OrbitDatabase: @unchecked Sendable {
             birthday_month = excluded.birthday_month,
             birthday_day = excluded.birthday_day,
             image_data = excluded.image_data,
-            last_synced_at = excluded.last_synced_at;
-        """)
-        defer { sqlite3_finalize(statement) }
+        last_synced_at = excluded.last_synced_at;
+        """
+
+    private static let contactColumnMigrations: [(name: String, definition: String)] = [
+        ("enriched_image_data", "BLOB"),
+        ("enriched_image_source", "TEXT"),
+        ("is_company", "INTEGER NOT NULL DEFAULT 0"),
+        ("verified_display_name", "TEXT"),
+        ("verified_phone_e164", "TEXT"),
+        ("reverse_enrichment_dump_json", "TEXT"),
+        ("reverse_enrichment_dump_status", "INTEGER"),
+        ("reverse_enrichment_dumped_at", "REAL"),
+        ("verification_status", "TEXT NOT NULL DEFAULT 'unverified'"),
+        ("verification_note", "TEXT NOT NULL DEFAULT ''"),
+        ("verified_at", "REAL"),
+        ("is_archived", "INTEGER NOT NULL DEFAULT 0"),
+        ("archived_at", "REAL"),
+        ("search_text", "TEXT NOT NULL DEFAULT ''"),
+        ("email_key", "TEXT NOT NULL DEFAULT ''"),
+        ("phone_key", "TEXT NOT NULL DEFAULT ''"),
+        ("name_key", "TEXT NOT NULL DEFAULT ''"),
+        ("last_activity_at", "REAL NOT NULL DEFAULT 0"),
+        ("next_follow_up_at", "REAL"),
+        ("open_follow_up_count", "INTEGER NOT NULL DEFAULT 0")
+    ]
+
+    private static let indexMigrations = [
+        "CREATE INDEX IF NOT EXISTS idx_contacts_display_name ON contacts(display_name);",
+        "CREATE INDEX IF NOT EXISTS idx_contacts_verification_status ON contacts(verification_status);",
+        "CREATE INDEX IF NOT EXISTS idx_contacts_is_archived ON contacts(is_archived);",
+        "CREATE INDEX IF NOT EXISTS idx_contacts_archived_follow_up ON contacts(is_archived, next_follow_up_at, display_name);",
+        "CREATE INDEX IF NOT EXISTS idx_contacts_archived_activity ON contacts(is_archived, last_activity_at DESC);",
+        "CREATE INDEX IF NOT EXISTS idx_contacts_phone_key ON contacts(phone_key);",
+        "CREATE INDEX IF NOT EXISTS idx_contacts_email_key ON contacts(email_key);",
+        "CREATE INDEX IF NOT EXISTS idx_contacts_name_key ON contacts(name_key);",
+        "CREATE INDEX IF NOT EXISTS idx_notes_contact_id_created_at ON notes(contact_id, created_at DESC);",
+        "CREATE INDEX IF NOT EXISTS idx_insights_contact_id_updated_at ON insights(contact_id, updated_at DESC);",
+        "CREATE INDEX IF NOT EXISTS idx_follow_ups_contact_id_due_at ON follow_ups(contact_id, due_at);",
+        "CREATE INDEX IF NOT EXISTS idx_follow_ups_completed_due ON follow_ups(completed_at, due_at, created_at DESC);"
+    ]
+
+    private func upsert(snapshot: ContactSyncSnapshot, statement: OpaquePointer?) throws {
+        sqlite3_reset(statement)
+        sqlite3_clear_bindings(statement)
         try bindText(snapshot.identifier, to: 1, in: statement)
         try bindText(snapshot.givenName, to: 2, in: statement)
         try bindText(snapshot.familyName, to: 3, in: statement)
         try bindText(snapshot.displayName.nonEmpty ?? snapshot.organizationName.nonEmpty ?? "Unknown Contact", to: 4, in: statement)
         try bindText(snapshot.organizationName, to: 5, in: statement)
-        try bindText(snapshot.jobTitle, to: 6, in: statement)
-        try bindText(snapshot.primaryEmail, to: 7, in: statement)
-        try bindText(snapshot.primaryPhone, to: 8, in: statement)
-        try bindText(snapshot.city, to: 9, in: statement)
-        try bindText(snapshot.country, to: 10, in: statement)
-        if let birthday = snapshot.birthday?.year { sqlite3_bind_int(statement, 11, Int32(birthday)) } else { sqlite3_bind_null(statement, 11) }
-        if let birthday = snapshot.birthday?.month { sqlite3_bind_int(statement, 12, Int32(birthday)) } else { sqlite3_bind_null(statement, 12) }
-        if let birthday = snapshot.birthday?.day { sqlite3_bind_int(statement, 13, Int32(birthday)) } else { sqlite3_bind_null(statement, 13) }
+        sqlite3_bind_int(statement, 6, snapshot.isCompany ? 1 : 0)
+        try bindText(snapshot.jobTitle, to: 7, in: statement)
+        try bindText(snapshot.primaryEmail, to: 8, in: statement)
+        try bindText(snapshot.primaryPhone, to: 9, in: statement)
+        try bindText(snapshot.city, to: 10, in: statement)
+        try bindText(snapshot.country, to: 11, in: statement)
+        if let birthday = snapshot.birthday?.year { sqlite3_bind_int(statement, 12, Int32(birthday)) } else { sqlite3_bind_null(statement, 12) }
+        if let birthday = snapshot.birthday?.month { sqlite3_bind_int(statement, 13, Int32(birthday)) } else { sqlite3_bind_null(statement, 13) }
+        if let birthday = snapshot.birthday?.day { sqlite3_bind_int(statement, 14, Int32(birthday)) } else { sqlite3_bind_null(statement, 14) }
         if let data = snapshot.imageData {
             _ = data.withUnsafeBytes { rawBuffer in
-                sqlite3_bind_blob(statement, 14, rawBuffer.baseAddress, Int32(rawBuffer.count), SQLITE_TRANSIENT)
+                sqlite3_bind_blob(statement, 15, rawBuffer.baseAddress, Int32(rawBuffer.count), SQLITE_TRANSIENT)
             }
         } else {
-            sqlite3_bind_null(statement, 14)
+            sqlite3_bind_null(statement, 15)
         }
-        sqlite3_bind_double(statement, 15, Date().timeIntervalSince1970)
+        sqlite3_bind_double(statement, 16, Date().timeIntervalSince1970)
         try stepDone(statement)
     }
 
@@ -781,7 +896,132 @@ final class OrbitDatabase: @unchecked Sendable {
             }
             try bindInt64(contactID, to: 6, in: statement)
             try stepDone(statement)
+            try refreshContactDerivedFields(contactID: contactID)
         }
+    }
+
+    nonisolated func updateContactIdentity(contactID: Int64, identity: AppleContactIdentityDraft) throws {
+        try queue.sync {
+            let identity = identity.trimmed
+            let statement = try prepare("""
+            UPDATE contacts
+            SET given_name = ?,
+                family_name = ?,
+                display_name = ?,
+                organization_name = ?,
+                is_company = ?,
+                last_synced_at = ?
+            WHERE id = ?;
+            """)
+            defer { sqlite3_finalize(statement) }
+            try bindText(identity.givenName, to: 1, in: statement)
+            try bindText(identity.familyName, to: 2, in: statement)
+            try bindText(identity.displayName, to: 3, in: statement)
+            try bindText(identity.organizationName, to: 4, in: statement)
+            sqlite3_bind_int(statement, 5, identity.isCompany ? 1 : 0)
+            sqlite3_bind_double(statement, 6, Date().timeIntervalSince1970)
+            try bindInt64(contactID, to: 7, in: statement)
+            try stepDone(statement)
+            try refreshContactDerivedFields(contactID: contactID)
+        }
+    }
+
+    nonisolated func updateMergedContactSummary(contactID: Int64, resolution: ContactMergeResolution) throws {
+        try queue.sync {
+            let identity = resolution.identity.trimmed
+            let statement = try prepare("""
+            UPDATE contacts
+            SET given_name = ?,
+                family_name = ?,
+                display_name = ?,
+                organization_name = ?,
+                is_company = ?,
+                job_title = ?,
+                primary_email = ?,
+                primary_phone = ?,
+                last_synced_at = ?
+            WHERE id = ?;
+            """)
+            defer { sqlite3_finalize(statement) }
+            try bindText(identity.givenName, to: 1, in: statement)
+            try bindText(identity.familyName, to: 2, in: statement)
+            try bindText(identity.displayName, to: 3, in: statement)
+            try bindText(identity.organizationName, to: 4, in: statement)
+            sqlite3_bind_int(statement, 5, identity.isCompany ? 1 : 0)
+            try bindText(resolution.jobTitle, to: 6, in: statement)
+            try bindText(resolution.primaryEmail, to: 7, in: statement)
+            try bindText(resolution.primaryPhone, to: 8, in: statement)
+            sqlite3_bind_double(statement, 9, Date().timeIntervalSince1970)
+            try bindInt64(contactID, to: 10, in: statement)
+            try stepDone(statement)
+            try refreshContactDerivedFields(contactID: contactID)
+        }
+    }
+
+    nonisolated func updateReverseEnrichmentDump(
+        contactID: Int64,
+        rawJSON: String,
+        statusCode: Int,
+        dumpedAt: Date
+    ) throws {
+        try queue.sync {
+            let statement = try prepare("""
+            UPDATE contacts
+            SET reverse_enrichment_dump_json = ?,
+                reverse_enrichment_dump_status = ?,
+                reverse_enrichment_dumped_at = ?
+            WHERE id = ?;
+            """)
+            defer { sqlite3_finalize(statement) }
+            try bindText(rawJSON, to: 1, in: statement)
+            sqlite3_bind_int(statement, 2, Int32(statusCode))
+            sqlite3_bind_double(statement, 3, dumpedAt.timeIntervalSince1970)
+            try bindInt64(contactID, to: 4, in: statement)
+            try stepDone(statement)
+        }
+    }
+
+    nonisolated func mergeLocalContactData(sourceContactIDs: [Int64], targetContactID: Int64) throws {
+        guard !sourceContactIDs.isEmpty else { return }
+        try queue.sync {
+            try execute("BEGIN IMMEDIATE TRANSACTION;")
+            do {
+                for sourceContactID in sourceContactIDs where sourceContactID != targetContactID {
+                    try reassignContactRows(table: "notes", sourceContactID: sourceContactID, targetContactID: targetContactID)
+                    try reassignContactRows(table: "insights", sourceContactID: sourceContactID, targetContactID: targetContactID)
+                    try reassignContactRows(table: "follow_ups", sourceContactID: sourceContactID, targetContactID: targetContactID)
+
+                    let statement = try prepare("""
+                    UPDATE contacts
+                    SET is_archived = 1,
+                        archived_at = ?
+                    WHERE id = ?;
+                    """)
+                    defer { sqlite3_finalize(statement) }
+                    sqlite3_bind_double(statement, 1, Date().timeIntervalSince1970)
+                    try bindInt64(sourceContactID, to: 2, in: statement)
+                    try stepDone(statement)
+                    try refreshContactDerivedFields(contactID: sourceContactID)
+                }
+                try refreshContactDerivedFields(contactID: targetContactID)
+                try execute("COMMIT;")
+            } catch {
+                try? execute("ROLLBACK;")
+                throw error
+            }
+        }
+    }
+
+    private func reassignContactRows(table: String, sourceContactID: Int64, targetContactID: Int64) throws {
+        let statement = try prepare("""
+        UPDATE \(table)
+        SET contact_id = ?
+        WHERE contact_id = ?;
+        """)
+        defer { sqlite3_finalize(statement) }
+        try bindInt64(targetContactID, to: 1, in: statement)
+        try bindInt64(sourceContactID, to: 2, in: statement)
+        try stepDone(statement)
     }
 
     nonisolated func updateEnrichedImage(contactID: Int64, imageData: Data, source: String) throws {
@@ -803,6 +1043,7 @@ final class OrbitDatabase: @unchecked Sendable {
             try bindText(source, to: 2, in: statement)
             try bindInt64(contactID, to: 3, in: statement)
             try stepDone(statement)
+            try refreshContactDerivedFields(contactID: contactID)
         }
     }
 
@@ -823,6 +1064,7 @@ final class OrbitDatabase: @unchecked Sendable {
             }
             try bindInt64(contactID, to: 3, in: statement)
             try stepDone(statement)
+            try refreshContactDerivedFields(contactID: contactID)
         }
     }
 
@@ -837,6 +1079,7 @@ final class OrbitDatabase: @unchecked Sendable {
             family_name TEXT NOT NULL DEFAULT '',
             display_name TEXT NOT NULL DEFAULT '',
             organization_name TEXT NOT NULL DEFAULT '',
+            is_company INTEGER NOT NULL DEFAULT 0,
             job_title TEXT NOT NULL DEFAULT '',
             primary_email TEXT,
             primary_phone TEXT,
@@ -850,24 +1093,28 @@ final class OrbitDatabase: @unchecked Sendable {
             enriched_image_source TEXT,
             verified_display_name TEXT,
             verified_phone_e164 TEXT,
+            reverse_enrichment_dump_json TEXT,
+            reverse_enrichment_dump_status INTEGER,
+            reverse_enrichment_dumped_at REAL,
             verification_status TEXT NOT NULL DEFAULT 'unverified',
             verification_note TEXT NOT NULL DEFAULT '',
             verified_at REAL,
             is_archived INTEGER NOT NULL DEFAULT 0,
             archived_at REAL,
+            search_text TEXT NOT NULL DEFAULT '',
+            email_key TEXT NOT NULL DEFAULT '',
+            phone_key TEXT NOT NULL DEFAULT '',
+            name_key TEXT NOT NULL DEFAULT '',
+            last_activity_at REAL NOT NULL DEFAULT 0,
+            next_follow_up_at REAL,
+            open_follow_up_count INTEGER NOT NULL DEFAULT 0,
             last_synced_at REAL NOT NULL
         );
         """)
 
-        try ensureContactsColumn(named: "enriched_image_data", definition: "BLOB")
-        try ensureContactsColumn(named: "enriched_image_source", definition: "TEXT")
-        try ensureContactsColumn(named: "verified_display_name", definition: "TEXT")
-        try ensureContactsColumn(named: "verified_phone_e164", definition: "TEXT")
-        try ensureContactsColumn(named: "verification_status", definition: "TEXT NOT NULL DEFAULT 'unverified'")
-        try ensureContactsColumn(named: "verification_note", definition: "TEXT NOT NULL DEFAULT ''")
-        try ensureContactsColumn(named: "verified_at", definition: "REAL")
-        try ensureContactsColumn(named: "is_archived", definition: "INTEGER NOT NULL DEFAULT 0")
-        try ensureContactsColumn(named: "archived_at", definition: "REAL")
+        for column in Self.contactColumnMigrations {
+            try ensureContactsColumn(named: column.name, definition: column.definition)
+        }
 
         if schemaVersion < 3 {
             try execute("DROP TABLE IF EXISTS notes;")
@@ -916,13 +1163,76 @@ final class OrbitDatabase: @unchecked Sendable {
         );
         """)
 
-        try execute("CREATE INDEX IF NOT EXISTS idx_contacts_display_name ON contacts(display_name);")
-        try execute("CREATE INDEX IF NOT EXISTS idx_contacts_verification_status ON contacts(verification_status);")
-        try execute("CREATE INDEX IF NOT EXISTS idx_contacts_is_archived ON contacts(is_archived);")
-        try execute("CREATE INDEX IF NOT EXISTS idx_notes_contact_id_created_at ON notes(contact_id, created_at DESC);")
-        try execute("CREATE INDEX IF NOT EXISTS idx_insights_contact_id_updated_at ON insights(contact_id, updated_at DESC);")
-        try execute("CREATE INDEX IF NOT EXISTS idx_follow_ups_contact_id_due_at ON follow_ups(contact_id, due_at);")
-        try execute("PRAGMA user_version = 3;")
+        for indexSQL in Self.indexMigrations {
+            try execute(indexSQL)
+        }
+
+        if schemaVersion < 4 {
+            try rebuildContactDerivedFields()
+        }
+        try execute("PRAGMA user_version = 4;")
+    }
+
+    private func rebuildContactDerivedFields() throws {
+        let statement = try prepare("SELECT id FROM contacts;")
+        defer { sqlite3_finalize(statement) }
+        var contactIDs: [Int64] = []
+        while sqlite3_step(statement) == SQLITE_ROW {
+            contactIDs.append(sqlite3_column_int64(statement, 0))
+        }
+        for contactID in contactIDs {
+            try refreshContactDerivedFields(contactID: contactID)
+        }
+    }
+
+    private func refreshContactDerivedFields(contactID: Int64) throws {
+        let statement = try prepare("""
+        UPDATE contacts
+        SET
+            email_key = LOWER(TRIM(COALESCE(primary_email, ''))),
+            phone_key = REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(LOWER(COALESCE(primary_phone, '')), ' ', ''), '-', ''), '.', ''), '(', ''), ')', ''), '+', ''),
+            name_key = LOWER(TRIM(COALESCE(NULLIF(TRIM(given_name || ' ' || family_name), ''), display_name, ''))),
+            search_text = LOWER(TRIM(
+                COALESCE(display_name, '') || ' ' ||
+                COALESCE(given_name, '') || ' ' ||
+                COALESCE(family_name, '') || ' ' ||
+                COALESCE(organization_name, '') || ' ' ||
+                COALESCE(job_title, '') || ' ' ||
+                COALESCE(primary_email, '') || ' ' ||
+                COALESCE(primary_phone, '') || ' ' ||
+                COALESCE(city, '') || ' ' ||
+                COALESCE(country, '') || ' ' ||
+                COALESCE((SELECT GROUP_CONCAT(body, ' ') FROM notes WHERE contact_id = contacts.id), '') || ' ' ||
+                COALESCE((SELECT GROUP_CONCAT(body, ' ') FROM insights WHERE contact_id = contacts.id), '')
+            )),
+            last_activity_at = MAX(
+                COALESCE((SELECT MAX(created_at) FROM notes WHERE contact_id = contacts.id), 0),
+                COALESCE((SELECT MAX(updated_at) FROM insights WHERE contact_id = contacts.id), 0),
+                COALESCE((SELECT MAX(created_at) FROM follow_ups WHERE contact_id = contacts.id), 0)
+            ),
+            next_follow_up_at = (
+                SELECT MIN(due_at)
+                FROM follow_ups
+                WHERE contact_id = contacts.id AND completed_at IS NULL
+            ),
+            open_follow_up_count = (
+                SELECT COUNT(*)
+                FROM follow_ups
+                WHERE contact_id = contacts.id AND completed_at IS NULL
+            )
+        WHERE id = ?;
+        """)
+        defer { sqlite3_finalize(statement) }
+        try bindInt64(contactID, to: 1, in: statement)
+        try stepDone(statement)
+    }
+
+    private func contactID(forRowID rowID: Int64, in table: String) throws -> Int64? {
+        let statement = try prepare("SELECT contact_id FROM \(table) WHERE id = ?;")
+        defer { sqlite3_finalize(statement) }
+        try bindInt64(rowID, to: 1, in: statement)
+        guard sqlite3_step(statement) == SQLITE_ROW else { return nil }
+        return sqlite3_column_int64(statement, 0)
     }
 
     private func currentSchemaVersion() throws -> Int {

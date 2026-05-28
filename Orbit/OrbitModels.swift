@@ -5,6 +5,7 @@ import SwiftUI
 enum SidebarFilter: String, CaseIterable, Identifiable {
     case allContacts
     case needsVerification
+    case duplicates
     case needsFollowUp
     case recentActivity
     case archived
@@ -15,6 +16,7 @@ enum SidebarFilter: String, CaseIterable, Identifiable {
         switch self {
         case .allContacts: "All Contacts"
         case .needsVerification: "Needs Verification"
+        case .duplicates: "Duplicates"
         case .needsFollowUp: "Needs Follow-Up"
         case .recentActivity: "Recent Activity"
         case .archived: "Archived"
@@ -25,6 +27,7 @@ enum SidebarFilter: String, CaseIterable, Identifiable {
         switch self {
         case .allContacts: "person.crop.rectangle.stack"
         case .needsVerification: "person.crop.circle.badge.questionmark"
+        case .duplicates: "person.2.badge.gearshape"
         case .needsFollowUp: "clock.badge.exclamationmark"
         case .recentActivity: "sparkles"
         case .archived: "archivebox"
@@ -44,6 +47,96 @@ enum ContactVerificationStatus: String, CaseIterable, Codable {
         case .verified: "Verified"
         }
     }
+}
+
+enum DuplicateMatchKind: String, CaseIterable {
+    case phone
+    case email
+    case name
+
+    var title: String {
+        switch self {
+        case .phone: "Same Phone"
+        case .email: "Same Email"
+        case .name: "Same Name"
+        }
+    }
+
+    var systemImage: String {
+        switch self {
+        case .phone: "phone"
+        case .email: "envelope"
+        case .name: "person.text.rectangle"
+        }
+    }
+}
+
+struct ContactDuplicateGroup: Identifiable, Hashable {
+    let kind: DuplicateMatchKind
+    let value: String
+    let contacts: [ContactListItem]
+
+    nonisolated var id: String {
+        "\(kind.rawValue):\(value)"
+    }
+
+    nonisolated var title: String {
+        "\(kind.title): \(value)"
+    }
+}
+
+struct ContactMergeCandidate: Identifiable, Hashable, Sendable {
+    let id: Int64
+    let appleIdentifier: String
+    let displayName: String
+    let givenName: String
+    let familyName: String
+    let organizationName: String
+    let isCompany: Bool
+    let jobTitle: String
+    let primaryEmail: String?
+    let primaryPhone: String?
+}
+
+struct ContactMergeDraft: Identifiable, Hashable {
+    let group: ContactDuplicateGroup
+    let targetID: Int64
+    let candidates: [ContactMergeCandidate]
+
+    var id: String {
+        "\(group.id):\(targetID)"
+    }
+
+    var target: ContactMergeCandidate? {
+        candidates.first { $0.id == targetID }
+    }
+}
+
+struct ContactMergeResolution: Sendable {
+    var identity: AppleContactIdentityDraft
+    var jobTitle: String
+    var primaryEmail: String?
+    var primaryPhone: String?
+}
+
+struct ReverseEnrichmentSuggestion: Identifiable, Sendable {
+    let id = UUID()
+    let source: String
+    let confidence: String?
+    let identity: AppleContactIdentityDraft
+    let jobTitle: String
+    let companyWebsite: String?
+    let linkedinURL: String?
+    let workEmail: String?
+    let phoneNumber: String?
+    let rawResponseJSON: String
+}
+
+struct PeopleDataLabsLookupResult: Sendable {
+    let suggestion: ReverseEnrichmentSuggestion?
+    let rawResponseJSON: String
+    let statusCode: Int
+    let message: String?
 }
 
 struct ContactListItem: Identifiable, Hashable {
@@ -94,6 +187,52 @@ struct OrbitContactBundle: Identifiable {
     }
 }
 
+nonisolated struct AppleContactIdentityDraft: Sendable {
+    var givenName: String
+    var familyName: String
+    var organizationName: String
+    var isCompany: Bool
+
+    nonisolated init(
+        givenName: String = "",
+        familyName: String = "",
+        organizationName: String = "",
+        isCompany: Bool = false
+    ) {
+        self.givenName = givenName
+        self.familyName = familyName
+        self.organizationName = organizationName
+        self.isCompany = isCompany
+    }
+
+    nonisolated init(core: ContactCore) {
+        givenName = core.givenName
+        familyName = core.familyName
+        organizationName = core.organizationName
+        isCompany = core.isCompany
+    }
+
+    nonisolated var trimmed: AppleContactIdentityDraft {
+        AppleContactIdentityDraft(
+            givenName: givenName.trimmingCharacters(in: .whitespacesAndNewlines),
+            familyName: familyName.trimmingCharacters(in: .whitespacesAndNewlines),
+            organizationName: organizationName.trimmingCharacters(in: .whitespacesAndNewlines),
+            isCompany: isCompany
+        )
+    }
+
+    nonisolated var displayName: String {
+        let identity = trimmed
+        if identity.isCompany, let organization = identity.organizationName.nonEmpty {
+            return organization
+        }
+        return [identity.givenName, identity.familyName]
+            .compactMap(\.nonEmpty)
+            .joined(separator: " ")
+            .nonEmpty ?? identity.organizationName.nonEmpty ?? "Unknown Contact"
+    }
+}
+
 struct ContactCore: Identifiable {
     let id: Int64
     let appleIdentifier: String
@@ -101,6 +240,7 @@ struct ContactCore: Identifiable {
     let familyName: String
     let displayName: String
     let organizationName: String
+    let isCompany: Bool
     let jobTitle: String
     let primaryEmail: String?
     let primaryPhone: String?
@@ -238,6 +378,7 @@ struct ContactSyncSnapshot {
     let familyName: String
     let displayName: String
     let organizationName: String
+    let isCompany: Bool
     let jobTitle: String
     let primaryEmail: String?
     let primaryPhone: String?
@@ -254,6 +395,7 @@ struct ContactSyncSnapshot {
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .nonEmpty ?? [contact.givenName, contact.familyName].joined(separator: " ").trimmingCharacters(in: .whitespaces)
         organizationName = contact.organizationName
+        isCompany = contact.contactType == .organization
         jobTitle = contact.jobTitle
         primaryEmail = contact.emailAddresses.first?.value as String?
         primaryPhone = contact.phoneNumbers.first?.value.stringValue
@@ -265,7 +407,7 @@ struct ContactSyncSnapshot {
 }
 
 extension String {
-    var nonEmpty: String? {
+    nonisolated var nonEmpty: String? {
         let trimmed = trimmingCharacters(in: .whitespacesAndNewlines)
         return trimmed.isEmpty ? nil : trimmed
     }

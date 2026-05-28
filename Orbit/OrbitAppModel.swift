@@ -10,6 +10,10 @@ final class OrbitAppModel: ObservableObject {
     @Published var selectedFilter: SidebarFilter = .allContacts
     @Published var searchText = ""
     @Published var contacts: [ContactListItem] = []
+    @Published var duplicateGroups: [ContactDuplicateGroup] = []
+    @Published var mergeCandidateContacts: [ContactListItem] = []
+    @Published var pendingMergeDraft: ContactMergeDraft?
+    @Published var pendingReverseEnrichmentSuggestion: ReverseEnrichmentSuggestion?
     @Published var selectedContactID: Int64?
     @Published var selectedBundle: OrbitContactBundle?
     @Published var authorizationStatus: CNAuthorizationStatus
@@ -19,7 +23,10 @@ final class OrbitAppModel: ObservableObject {
     @Published var pendingVerificationPhoneE164: String?
 
     var contactListTitle: String {
-        "\(contacts.count) Contact\(contacts.count == 1 ? "" : "s")"
+        if selectedFilter == .duplicates {
+            return "\(duplicateGroups.count) Duplicate Group\(duplicateGroups.count == 1 ? "" : "s")"
+        }
+        return "\(contacts.count) Contact\(contacts.count == 1 ? "" : "s")"
     }
 
     var isPreparingInitialContacts: Bool {
@@ -28,6 +35,7 @@ final class OrbitAppModel: ObservableObject {
 
     private let database: OrbitDatabase
     private let contactsBridge = ContactsBridge()
+    private let peopleDataLabsClient = PeopleDataLabsClient()
     private(set) var mcpServer: OrbitMCPServer?
     private var contactsDidChangeObserver: NSObjectProtocol?
     private var pendingAutoRefreshTask: Task<Void, Never>?
@@ -82,7 +90,7 @@ final class OrbitAppModel: ObservableObject {
 
         do {
             if authorizationStatus == .authorized {
-                let snapshots = try contactsBridge.fetchSnapshots()
+                let snapshots = try await contactsBridge.fetchSnapshotsAsync()
                 try database.syncContacts(snapshots)
                 emptySearchContactCache.removeAll()
             }
@@ -223,22 +231,66 @@ final class OrbitAppModel: ObservableObject {
         }
     }
 
-    func confirmVerification(contactID: Int64, appleDisplayName: String) {
+    func reverseEnrich(contactID: Int64) {
         Task {
             do {
                 guard let bundle = try database.fetchContactBundle(contactID: contactID) else { return }
-                let normalizedPhone = try PhoneNumberNormalizer.normalize(bundle.core.primaryPhone).e164
-                let trimmedName = appleDisplayName.trimmingCharacters(in: .whitespacesAndNewlines)
-                let didRenameAppleContact = trimmedName.nonEmpty != nil && trimmedName != bundle.core.displayName
-
-                if let newName = trimmedName.nonEmpty, newName != bundle.core.displayName {
-                    try contactsBridge.updateDisplayName(
-                        contactIdentifier: bundle.core.appleIdentifier,
-                        displayName: newName
-                    )
-                    emptySearchContactCache.removeAll()
-                    await refreshContactsFromStore()
+                let result = try await peopleDataLabsClient.enrich(core: bundle.core)
+                try database.updateReverseEnrichmentDump(
+                    contactID: contactID,
+                    rawJSON: result.rawResponseJSON,
+                    statusCode: result.statusCode,
+                    dumpedAt: .now
+                )
+                if let suggestion = result.suggestion {
+                    pendingReverseEnrichmentSuggestion = suggestion
+                } else {
+                    pendingReverseEnrichmentSuggestion = nil
+                    errorMessage = result.message ?? "People Data Labs did not return a usable profile."
                 }
+            } catch {
+                errorMessage = error.localizedDescription
+            }
+        }
+    }
+
+    func applyReverseEnrichment(contactID: Int64, resolution: ContactMergeResolution) {
+        Task {
+            do {
+                guard let bundle = try database.fetchContactBundle(contactID: contactID) else { return }
+                try await contactsBridge.updateResolvedContactSummary(
+                    contactIdentifier: bundle.core.appleIdentifier,
+                    resolution: resolution
+                )
+                try database.updateMergedContactSummary(
+                    contactID: contactID,
+                    resolution: resolution
+                )
+                try database.addNote(
+                    contactID: contactID,
+                    body: "Applied reverse enrichment suggestions from People Data Labs.",
+                    source: .imported
+                )
+                pendingReverseEnrichmentSuggestion = nil
+                emptySearchContactCache.removeAll()
+                scheduleReloadList(immediate: true)
+                scheduleReloadSelection()
+            } catch {
+                errorMessage = error.localizedDescription
+            }
+        }
+    }
+
+    func confirmVerification(contactID: Int64, appleIdentity: AppleContactIdentityDraft) {
+        Task {
+            do {
+                guard let bundle = try database.fetchContactBundle(contactID: contactID) else { return }
+                let normalizedPhone = try? PhoneNumberNormalizer.normalize(bundle.core.primaryPhone).e164
+                let trimmedIdentity = appleIdentity.trimmed
+                let didUpdateAppleContact = trimmedIdentity.givenName != bundle.core.givenName
+                    || trimmedIdentity.familyName != bundle.core.familyName
+                    || trimmedIdentity.organizationName != bundle.core.organizationName
+                    || trimmedIdentity.isCompany != bundle.core.isCompany
 
                 try database.updateVerificationStatus(
                     contactID: contactID,
@@ -248,9 +300,28 @@ final class OrbitAppModel: ObservableObject {
                     verifiedAt: .now
                 )
 
+                var didSaveAppleIdentity = false
+                var appleIdentityUpdateError: Error?
+                if didUpdateAppleContact {
+                    do {
+                        try await contactsBridge.updateIdentity(
+                            contactIdentifier: bundle.core.appleIdentifier,
+                            identity: trimmedIdentity
+                        )
+                        try database.updateContactIdentity(
+                            contactID: contactID,
+                            identity: trimmedIdentity
+                        )
+                        didSaveAppleIdentity = true
+                        emptySearchContactCache.removeAll()
+                    } catch {
+                        appleIdentityUpdateError = error
+                    }
+                }
+
                 let timelineNote = [
-                    "Verified in WhatsApp on \(DateFormatter.orbitTimeline.string(from: .now)).",
-                    didRenameAppleContact ? "Updated Apple contact name to \(trimmedName)." : nil
+                    "\(normalizedPhone == nil ? "Manually verified" : "Verified in WhatsApp") on \(DateFormatter.orbitTimeline.string(from: .now)).",
+                    didSaveAppleIdentity ? "Updated Apple contact identity to \(trimmedIdentity.displayName)." : nil
                 ]
                     .compactMap { $0 }
                     .joined(separator: " ")
@@ -269,6 +340,11 @@ final class OrbitAppModel: ObservableObject {
                 searchText = ""
                 pendingVerificationPhoneE164 = normalizedPhone
                 scheduleReloadList(immediate: true)
+                scheduleReloadSelection()
+
+                if let appleIdentityUpdateError {
+                    errorMessage = "Marked verified, but could not update Apple Contacts: \(appleIdentityUpdateError.localizedDescription)"
+                }
             } catch {
                 errorMessage = error.localizedDescription
             }
@@ -317,15 +393,95 @@ final class OrbitAppModel: ObservableObject {
         }
     }
 
+    func prepareDuplicateMerge(_ group: ContactDuplicateGroup, into targetContactID: Int64) {
+        Task {
+            do {
+                let contactIDs = group.contacts.map(\.id)
+                let candidates = try await Task.detached(priority: .userInitiated) { [database] in
+                    try database.fetchMergeCandidates(contactIDs: contactIDs)
+                }.value
+                pendingMergeDraft = ContactMergeDraft(
+                    group: group,
+                    targetID: targetContactID,
+                    candidates: candidates
+                )
+            } catch {
+                errorMessage = error.localizedDescription
+            }
+        }
+    }
+
+    func loadManualMergeCandidates(excluding targetContactID: Int64, search: String) {
+        Task {
+            do {
+                let items = try await Task.detached(priority: .userInitiated) { [database] in
+                    try database.fetchContacts(filter: .allContacts, search: search)
+                }.value
+                mergeCandidateContacts = items.filter { $0.id != targetContactID }
+            } catch {
+                errorMessage = error.localizedDescription
+            }
+        }
+    }
+
+    func prepareManualMerge(targetContactID: Int64, sourceContactID: Int64) {
+        Task {
+            do {
+                let candidates = try await Task.detached(priority: .userInitiated) { [database] in
+                    try database.fetchMergeCandidates(contactIDs: [targetContactID, sourceContactID])
+                }.value
+                pendingMergeDraft = ContactMergeDraft(
+                    group: ContactDuplicateGroup(kind: .name, value: "Manual Merge", contacts: []),
+                    targetID: targetContactID,
+                    candidates: candidates
+                )
+            } catch {
+                errorMessage = error.localizedDescription
+            }
+        }
+    }
+
+    func mergeDuplicateGroup(_ draft: ContactMergeDraft, resolution: ContactMergeResolution) {
+        Task {
+            do {
+                guard let target = draft.candidates.first(where: { $0.id == draft.targetID }) else { return }
+                let sources = draft.candidates.filter { $0.id != draft.targetID }
+                guard !sources.isEmpty else { return }
+
+                try await contactsBridge.mergeContacts(
+                    targetIdentifier: target.appleIdentifier,
+                    sourceIdentifiers: sources.map(\.appleIdentifier),
+                    resolution: resolution
+                )
+                try database.updateMergedContactSummary(
+                    contactID: draft.targetID,
+                    resolution: resolution
+                )
+                try database.mergeLocalContactData(
+                    sourceContactIDs: sources.map(\.id),
+                    targetContactID: draft.targetID
+                )
+                emptySearchContactCache.removeAll()
+                pendingMergeDraft = nil
+                selectedContactID = draft.targetID
+                scheduleReloadList(immediate: true)
+                scheduleReloadSelection()
+            } catch {
+                errorMessage = error.localizedDescription
+            }
+        }
+    }
+
     func scheduleReloadList(immediate: Bool = false) {
         let filter = selectedFilter
         let search = searchText
         let currentSelection = selectedContactID
 
-        if search.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+        if filter != .duplicates,
+           search.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
            let cachedItems = emptySearchContactCache[filter] {
             applyContactList(cachedItems, currentSelection: currentSelection)
-        } else if let cachedItems = emptySearchContactCache[filter] {
+        } else if filter != .duplicates, let cachedItems = emptySearchContactCache[filter] {
             let cachedSearchResults = contactFieldSearchResults(
                 in: cachedItems,
                 search: search
@@ -452,12 +608,23 @@ final class OrbitAppModel: ObservableObject {
         search: String,
         currentSelection: Int64?
     ) async throws {
+        if filter == .duplicates {
+            let groups = try await Task.detached(priority: .userInitiated) {
+                try database.fetchDuplicateGroups(search: search)
+            }.value
+            guard !Task.isCancelled else { return }
+            duplicateGroups = groups
+            applyContactList(groups.flatMap(\.contacts), currentSelection: currentSelection)
+            return
+        }
+
         let isEmptySearch = search.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         let items = try await Task.detached(priority: .userInitiated) {
             try database.fetchContacts(filter: filter, search: search)
         }.value
         guard !Task.isCancelled else { return }
 
+        duplicateGroups = []
         if isEmptySearch {
             emptySearchContactCache[filter] = items
         }
