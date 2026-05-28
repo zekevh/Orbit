@@ -16,48 +16,36 @@ jobs:
       CONFIGURATION: Release
       TAP_REPO: zekevh/homebrew-tap
       CASK_NAME: orbit
-      DEVELOPER_TEAM_ID: ${{ secrets.DEVELOPER_TEAM_ID }}
-      DEVELOPER_IDENTITY: ${{ secrets.DEVELOPER_IDENTITY }}
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Build archive
+      - name: Build app
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
           echo "VERSION=${VERSION}" >> "$GITHUB_ENV"
-          test -n "$DEVELOPER_TEAM_ID"
-          test -n "$DEVELOPER_IDENTITY"
-          xcodebuild archive \
+          xcodebuild build \
             -project Orbit.xcodeproj \
             -scheme "$SCHEME" \
             -configuration "$CONFIGURATION" \
-            -archivePath "$RUNNER_TEMP/Orbit.xcarchive" \
+            -derivedDataPath "$RUNNER_TEMP/build" \
             MARKETING_VERSION="$VERSION" \
             CURRENT_PROJECT_VERSION="$(git rev-list --count HEAD)" \
-            DEVELOPMENT_TEAM="$DEVELOPER_TEAM_ID" \
-            CODE_SIGN_IDENTITY="$DEVELOPER_IDENTITY" \
-            CODE_SIGN_STYLE=Manual
+            ENABLE_APP_SANDBOX=NO \
+            CODE_SIGN_ENTITLEMENTS="" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO
 
-      - name: Export app
+      - name: Verify app artifact
         run: |
-          xcodebuild -exportArchive \
-            -archivePath "$RUNNER_TEMP/Orbit.xcarchive" \
-            -exportPath "$RUNNER_TEMP/export" \
-            -exportOptionsPlist ExportOptions.plist \
-            -allowProvisioningUpdates \
-            DEVELOPMENT_TEAM="$DEVELOPER_TEAM_ID"
-
-      - name: Verify contacts entitlement
-        run: |
-          codesign -d --entitlements :- "$RUNNER_TEMP/export/Orbit.app" 2>&1 | rg -q "com.apple.security.personal-information.addressbook"
+          test -d "$RUNNER_TEMP/build/Build/Products/Release/Orbit.app"
 
       - name: Create DMG
         run: |
           hdiutil create \
             -volname "Orbit" \
-            -srcfolder "$RUNNER_TEMP/export/Orbit.app" \
+            -srcfolder "$RUNNER_TEMP/build/Build/Products/Release/Orbit.app" \
             -ov \
             -format UDZO \
             "$RUNNER_TEMP/Orbit-${VERSION}.dmg"

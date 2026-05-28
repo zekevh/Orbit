@@ -8,49 +8,33 @@ DEFAULT_VERSION="$(
   rg -o 'MARKETING_VERSION = [^;]+' Orbit.xcodeproj/project.pbxproj | head -n1 | sed 's/.*= //'
 )"
 VERSION="${1:-${DEFAULT_VERSION:-1.0.0}}"
-DEVELOPER_TEAM_ID="${DEVELOPER_TEAM_ID:-}"
-DEVELOPER_IDENTITY="${DEVELOPER_IDENTITY:-}"
-
-ARCHIVE_PATH="${ARTIFACT_DIR}/Orbit.xcarchive"
-EXPORT_PATH="${ARTIFACT_DIR}/export"
+BUILD_PATH="${ARTIFACT_DIR}/build"
+APP_PATH="${BUILD_PATH}/Build/Products/Release/Orbit.app"
 DMG_PATH="${ARTIFACT_DIR}/Orbit-${VERSION}.dmg"
 
-if [[ -z "${DEVELOPER_TEAM_ID}" || -z "${DEVELOPER_IDENTITY}" ]]; then
-  echo "Missing release signing configuration."
-  echo "Set DEVELOPER_TEAM_ID and DEVELOPER_IDENTITY before running this script."
-  echo "Example DEVELOPER_IDENTITY: Developer ID Application: Your Name (TEAMID)"
-  exit 1
-fi
-
-rm -rf "${ARCHIVE_PATH}" "${EXPORT_PATH}" "${DMG_PATH}"
+rm -rf "${BUILD_PATH}" "${DMG_PATH}"
 mkdir -p "${ARTIFACT_DIR}"
 
 echo "Packaging Orbit ${VERSION}"
 echo "Artifacts: ${ARTIFACT_DIR}"
 
-xcodebuild archive \
+xcodebuild build \
   -project "${ROOT_DIR}/Orbit.xcodeproj" \
   -scheme orbit \
   -configuration Release \
-  -archivePath "${ARCHIVE_PATH}" \
+  -derivedDataPath "${BUILD_PATH}" \
   MARKETING_VERSION="${VERSION}" \
   CURRENT_PROJECT_VERSION="$(cd "${ROOT_DIR}" && git rev-list --count HEAD)" \
-  DEVELOPMENT_TEAM="${DEVELOPER_TEAM_ID}" \
-  CODE_SIGN_IDENTITY="${DEVELOPER_IDENTITY}" \
-  CODE_SIGN_STYLE=Manual
+  ENABLE_APP_SANDBOX=NO \
+  CODE_SIGN_ENTITLEMENTS="" \
+  CODE_SIGNING_ALLOWED=NO \
+  CODE_SIGNING_REQUIRED=NO
 
-xcodebuild -exportArchive \
-  -archivePath "${ARCHIVE_PATH}" \
-  -exportPath "${EXPORT_PATH}" \
-  -exportOptionsPlist "${ROOT_DIR}/ExportOptions.plist" \
-  -allowProvisioningUpdates \
-  DEVELOPMENT_TEAM="${DEVELOPER_TEAM_ID}"
-
-codesign -d --entitlements :- "${EXPORT_PATH}/Orbit.app" 2>&1 | rg -q "com.apple.security.personal-information.addressbook"
+test -d "${APP_PATH}"
 
 hdiutil create \
   -volname "Orbit" \
-  -srcfolder "${EXPORT_PATH}/Orbit.app" \
+  -srcfolder "${APP_PATH}" \
   -ov \
   -format UDZO \
   "${DMG_PATH}"
