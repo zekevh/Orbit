@@ -20,6 +20,8 @@ enum OrbitDatabaseError: LocalizedError {
 }
 
 final class OrbitDatabase: @unchecked Sendable {
+    private static let currentSchemaVersion = 4
+
     private let db: OpaquePointer
     private let queue = DispatchQueue(label: "io.zvh.orbit.database")
 
@@ -801,29 +803,6 @@ final class OrbitDatabase: @unchecked Sendable {
         last_synced_at = excluded.last_synced_at;
         """
 
-    private static let contactColumnMigrations: [(name: String, definition: String)] = [
-        ("enriched_image_data", "BLOB"),
-        ("enriched_image_source", "TEXT"),
-        ("is_company", "INTEGER NOT NULL DEFAULT 0"),
-        ("verified_display_name", "TEXT"),
-        ("verified_phone_e164", "TEXT"),
-        ("reverse_enrichment_dump_json", "TEXT"),
-        ("reverse_enrichment_dump_status", "INTEGER"),
-        ("reverse_enrichment_dumped_at", "REAL"),
-        ("verification_status", "TEXT NOT NULL DEFAULT 'unverified'"),
-        ("verification_note", "TEXT NOT NULL DEFAULT ''"),
-        ("verified_at", "REAL"),
-        ("is_archived", "INTEGER NOT NULL DEFAULT 0"),
-        ("archived_at", "REAL"),
-        ("search_text", "TEXT NOT NULL DEFAULT ''"),
-        ("email_key", "TEXT NOT NULL DEFAULT ''"),
-        ("phone_key", "TEXT NOT NULL DEFAULT ''"),
-        ("name_key", "TEXT NOT NULL DEFAULT ''"),
-        ("last_activity_at", "REAL NOT NULL DEFAULT 0"),
-        ("next_follow_up_at", "REAL"),
-        ("open_follow_up_count", "INTEGER NOT NULL DEFAULT 0")
-    ]
-
     private static let indexMigrations = [
         "CREATE INDEX IF NOT EXISTS idx_contacts_display_name ON contacts(display_name);",
         "CREATE INDEX IF NOT EXISTS idx_contacts_verification_status ON contacts(verification_status);",
@@ -1070,6 +1049,9 @@ final class OrbitDatabase: @unchecked Sendable {
 
     private func migrate() throws {
         let schemaVersion = try currentSchemaVersion()
+        if schemaVersion > 0 && schemaVersion < Self.currentSchemaVersion {
+            try resetDatabaseForLatestSchema()
+        }
 
         try execute("""
         CREATE TABLE IF NOT EXISTS contacts (
@@ -1112,22 +1094,6 @@ final class OrbitDatabase: @unchecked Sendable {
         );
         """)
 
-        for column in Self.contactColumnMigrations {
-            try ensureContactsColumn(named: column.name, definition: column.definition)
-        }
-
-        if schemaVersion < 3 {
-            try execute("DROP TABLE IF EXISTS notes;")
-            try execute("DROP TABLE IF EXISTS insights;")
-            try execute("DROP TABLE IF EXISTS derived_facts;")
-            try execute("DROP TABLE IF EXISTS follow_ups;")
-            try execute("DROP TABLE IF EXISTS context_entries;")
-            try execute("DROP INDEX IF EXISTS idx_notes_contact_id_created_at;")
-            try execute("DROP INDEX IF EXISTS idx_insights_contact_id_updated_at;")
-            try execute("DROP INDEX IF EXISTS idx_derived_facts_contact_id_created_at;")
-            try execute("DROP INDEX IF EXISTS idx_follow_ups_contact_id_due_at;")
-        }
-
         try execute("""
         CREATE TABLE IF NOT EXISTS notes (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1167,10 +1133,17 @@ final class OrbitDatabase: @unchecked Sendable {
             try execute(indexSQL)
         }
 
-        if schemaVersion < 4 {
-            try rebuildContactDerivedFields()
-        }
-        try execute("PRAGMA user_version = 4;")
+        try execute("PRAGMA user_version = \(Self.currentSchemaVersion);")
+    }
+
+    private func resetDatabaseForLatestSchema() throws {
+        try execute("DROP TABLE IF EXISTS notes;")
+        try execute("DROP TABLE IF EXISTS insights;")
+        try execute("DROP TABLE IF EXISTS follow_ups;")
+        try execute("DROP TABLE IF EXISTS contacts;")
+        try execute("DROP TABLE IF EXISTS derived_facts;")
+        try execute("DROP TABLE IF EXISTS context_entries;")
+        try execute("PRAGMA user_version = 0;")
     }
 
     private func rebuildContactDerivedFields() throws {
@@ -1240,22 +1213,6 @@ final class OrbitDatabase: @unchecked Sendable {
         defer { sqlite3_finalize(statement) }
         guard sqlite3_step(statement) == SQLITE_ROW else { return 0 }
         return Int(sqlite3_column_int(statement, 0))
-    }
-
-    private func ensureContactsColumn(named name: String, definition: String) throws {
-        guard try !contactsTableHasColumn(named: name) else { return }
-        try execute("ALTER TABLE contacts ADD COLUMN \(name) \(definition);")
-    }
-
-    private func contactsTableHasColumn(named name: String) throws -> Bool {
-        let statement = try prepare("PRAGMA table_info(contacts);")
-        defer { sqlite3_finalize(statement) }
-        while sqlite3_step(statement) == SQLITE_ROW {
-            if string(at: 1, in: statement) == name {
-                return true
-            }
-        }
-        return false
     }
 
     private func execute(_ sql: String) throws {
